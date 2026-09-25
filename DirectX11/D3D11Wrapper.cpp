@@ -753,7 +753,7 @@ static bool ForceDX11(D3D_FEATURE_LEVEL *featureLevels)
 	return false;
 }
 
-static HackerDevice* wrap_d3d11_device_and_context(ID3D11Device **ppDevice, ID3D11DeviceContext **ppImmediateContext)
+HackerDevice* wrap_d3d11_device_and_context(ID3D11Device **ppDevice, ID3D11DeviceContext **ppImmediateContext)
 {
 	// Optional parameters means these might be null.
 	ID3D11Device *retDevice = ppDevice ? *ppDevice : nullptr;

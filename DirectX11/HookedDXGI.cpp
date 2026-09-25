@@ -169,17 +169,37 @@ static HackerDevice* sort_out_swap_chain_device_mess(IUnknown **device)
 		analyse_iunknown(*device);
 
 		if (check_interface_supported(*device, IID_ID3D11Device)) {
-			// If we do end up in another situation where we are
-			// seeing a device for the first time (like
-			// CreateDeviceAndSwapChain calling back into us), we
-			// could consider creating our HackerDevice here. But
-			// for now we aren't expecting this to happen, so treat
-			// it as fatal if it does.
-			//
-			// D3D11On12CreateDevice() could possibly lead us here,
-			// depending on how that works.
-			LogInfo("BUG: Unwrapped ID3D11Device!\n");
-			DoubleBeepExit();
+			ID3D11Device *d3d11_device = NULL;
+			ID3D11DeviceContext *immediate_context = NULL;
+			HRESULT hr = (*device)->QueryInterface(IID_PPV_ARGS(&d3d11_device));
+
+			LogInfo("Late attach: adopting existing ID3D11Device %p, QueryInterface result = %#x\n",
+				*device, hr);
+			if (SUCCEEDED(hr)) {
+				d3d11_device->GetImmediateContext(&immediate_context);
+				LogInfo("Late attach: existing immediate context = %p\n", immediate_context);
+
+				hackerDevice = wrap_d3d11_device_and_context(
+					&d3d11_device, &immediate_context);
+				if (hackerDevice) {
+					// CreateSwapChain must always receive the real device. With
+					// hook=recommended, calls through the application's existing
+					// Device and Context pointers now route through 3DMigoto.
+					*device = hackerDevice->GetPossiblyHookedOrigDevice1();
+					LogInfo("Late attach: HackerDevice %p adopted existing device; passing %p to DXGI\n",
+						hackerDevice, *device);
+				}
+
+				// GetImmediateContext and the wrapper helper each transfer a
+				// COM reference. This local result is not returned to the game.
+				if (immediate_context)
+					immediate_context->Release();
+			}
+
+			if (hackerDevice)
+				return hackerDevice;
+
+			LogInfo("ERROR: Failed to adopt existing ID3D11Device\n");
 		}
 
 		LogInfo("FATAL: Unsupported DirectX Version!\n");

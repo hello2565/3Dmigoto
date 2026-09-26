@@ -92,23 +92,16 @@ protected:
 public:
 	OverrideParams mOverrideParams;
 	OverrideVars mOverrideVars;
-	float mOverrideSeparation;
-	float mOverrideConvergence;
 
 	OverrideParams mSavedParams;
 	OverrideVars mSavedVars;
-	float mUserSeparation;
-	float mUserConvergence;
 
 	Override();
-	Override(OverrideParams *params, OverrideVars *vars, float separation,
-		 float convergence, int transition, int release_transition,
+	Override(OverrideParams *params, OverrideVars *vars, int transition, int release_transition,
 		 TransitionType transition_type,
 		 TransitionType release_transition_type,
 		 bool is_conditional, CommandListExpression condition,
 		 CommandList activate_command_list, CommandList deactivate_command_list) :
-		mOverrideSeparation(separation),
-		mOverrideConvergence(convergence),
 		transition(transition),
 		release_transition(release_transition),
 		transition_type(transition_type),
@@ -145,13 +138,12 @@ public:
 		type(type)
 	{}
 	KeyOverride(KeyOverrideType type, OverrideParams *params, OverrideVars *vars,
-			float separation, float convergence,
 			int transition, int release_transition,
 			TransitionType transition_type,
 			TransitionType release_transition_type,
 			bool is_conditional, CommandListExpression condition,
 			CommandList activate_command_list, CommandList deactivate_command_list) :
-		Override(params, vars, separation, convergence,
+		Override(params, vars,
 				transition, release_transition,
 				transition_type, release_transition_type,
 				is_conditional, condition,
@@ -244,10 +236,8 @@ class OverrideTransition
 public:
 	std::map<OverrideParam, OverrideTransitionParam> params;
 	std::map<CommandListVariable*, OverrideTransitionParam> vars;
-	OverrideTransitionParam separation, convergence;
 
 	void ScheduleTransition(HackerDevice *wrapper,
-			float target_separation, float target_convergence,
 			OverrideParams *targets, OverrideVars *vars,
 			int time, TransitionType transition_type);
 	void UpdatePresets(HackerDevice *wrapper);
@@ -278,7 +268,6 @@ class OverrideGlobalSave
 public:
 	std::map<OverrideParam, OverrideGlobalSaveParam> params;
 	std::map<CommandListVariable*, OverrideGlobalSaveParam> vars;
-	OverrideGlobalSaveParam separation, convergence;
 
 	void Reset(HackerDevice* wrapper);
 	void Save(HackerDevice *wrapper, Override *preset);

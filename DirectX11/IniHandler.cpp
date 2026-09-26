@@ -14,17 +14,13 @@
 #include "Globals.h"
 #include "Override.h"
 #include "Hunting.h"
-#include "nvprofile.h"
 #include "ShaderRegex.h"
 #include "cursor.h"
+#include <chrono>
 
-#include "shellscalingapi.h"
-
-#include <filesystem>
-// TODO: We probably don't need this <filesystem> header
-// TODO: Remove this #define after we switch to C++17 and remove 'experimental'
-#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
-#include <experimental/filesystem>
+#include "vector"
+#include <locale>
+#include <cmath>
 
 #define INI_FILENAME L"d3dx.ini"
 
@@ -45,19 +41,19 @@ struct Section {
 	bool prefix;
 };
 static Section CommandListSections[] = {
-	{L"ShaderOverride", true},
-	{L"ShaderRegex", true},
 	{L"TextureOverride", true},
-	{L"CustomShader", true},
 	{L"CommandList", true},
-	{L"BuiltInCustomShader", true},
-	{L"BuiltInCommandList", true},
+	{L"Constants", false},
 	{L"Present", false},
+	{L"ShaderOverride", true},
+	{L"CustomShader", true},
+	{L"ShaderRegex", true},
+	{L"BuiltInCommandList", true},
+	{L"BuiltInCustomShader", true},
 	{L"ClearRenderTargetView", false},
 	{L"ClearDepthStencilView", false},
 	{L"ClearUnorderedAccessViewUint", false},
 	{L"ClearUnorderedAccessViewFloat", false},
-	{L"Constants", false},
 };
 
 // List all remaining sections so we can verify that every section listed in
@@ -66,27 +62,29 @@ static Section CommandListSections[] = {
 // list a section in both lists - put it above if it is a command list section,
 // and in this list if it is not:
 static Section RegularSections[] = {
-	{L"Logging", false},
-	{L"System", false},
-	{L"Device", false},
-	{L"Stereo", false},
-	{L"Rendering", false},
-	{L"Hunting", false},
-	{L"Profile", false},
-	{L"ConvergenceMap", false}, // Only used in nvapi wrapper
+	{L"Pool", true},
 	{L"Resource", true},
 	{L"Key", true},
-	{L"Preset", true},
 	{L"Include", true}, // Prefix so that it may be namespaced to allow included files to include more files with relative paths
+	{L"Preset", true},
+	{L"Hunting", false},
+	{L"Logging", false},
+	{L"System", false},
+	{L"Input", false},
+	{L"Device", false},
+	{L"Rendering", false},
 	{L"Loader", false},
+	{L"Profile", false},
+	{L"Stereo", false},
+	{L"ConvergenceMap", false},
 };
 
 // List of sections that will not trigger a warning if they contain a line
 // without an equals sign. All command lists are also permitted this privilege
 // to allow for cleaner flow control syntax (if/else/endif)
 static Section AllowLinesWithoutEquals[] = {
-	{L"Profile", false},
 	{L"ShaderRegex", true},
+	{L"Profile", false},
 };
 
 static bool whitelisted_duplicate_key(const wchar_t *section, const wchar_t *key)
@@ -219,6 +217,7 @@ struct IniSection {
 typedef std::map<wstring, IniSection, WStringInsensitiveLess> IniSections;
 
 IniSections ini_sections;
+std::unordered_set<wstring> recursive_includes;
 
 // Returns an iterator to the first element in a set that does not begin with
 // prefix in a case insensitive way. Combined with set::lower_bound, this can
@@ -257,7 +256,13 @@ static void emit_ini_warning_tone()
 	if (!ini_warned)
 		return;
 	ini_warned = false;
-	BeepFailure();
+	if (G->gShowWarnings)
+		BeepFailure();
+}
+
+inline wchar_t ascii_tolower(wchar_t c)
+{
+	return (c >= L'A' && c <= L'Z') ? c + (L'a' - L'A') : c;
 }
 
 static bool get_namespaced_section_name(const wstring *section, const wstring *ini_namespace, wstring *ret)
@@ -281,10 +286,12 @@ bool get_namespaced_section_name_lower(const wstring *section, const wstring *in
 	return rc;
 }
 
-wstring get_namespaced_var_name_lower(const wstring var, const wstring *ini_namespace)
+wstring get_namespaced_var_name_lower(const wstring& low_name, const wstring* ini_namespace)
 {
-	wstring ret = wstring(L"$\\") + *ini_namespace + wstring(L"\\") + var.substr(1);
-	std::transform(ret.begin(), ret.end(), ret.begin(), ::towlower);
+	wstring ret = L"$\\" + *ini_namespace + L'\\';
+	auto namespace_begin = ret.begin() + 2;  // Skip "$\\"
+	std::transform(namespace_begin, namespace_begin + ini_namespace->size(), namespace_begin, ::towlower);
+	ret.append(low_name, 1, wstring::npos);
 	return ret;
 }
 
@@ -359,16 +366,16 @@ static bool get_namespaced_section_path(const wchar_t *section, wstring *ret)
 
 static void ParseIniSectionLine(wstring *wline, wstring *section,
 		int *warn_duplicates, bool *warn_lines_without_equals,
-		IniSectionVector **section_vector, const wstring *ini_namespace,
+		IniSection **section_entry, const wstring *ini_namespace,
 		const wstring *ini_path)
 {
 	bool allow_duplicate_sections = false;
 	size_t first, last;
-	bool inserted;
 	bool namespaced_section = false;
 
 	*warn_duplicates = 1;
 	*warn_lines_without_equals = true;
+	*section_entry = NULL;
 
 	// To match the behaviour of GetPrivateProfileString, we use up until
 	// the first ] as the section name. If there is no ] character, we use
@@ -409,35 +416,35 @@ static void ParseIniSectionLine(wstring *wline, wstring *section,
 	// key matches, which would have to be handled elsewhere.  For now,
 	// continue warning about duplicate sections and match the old
 	// behaviour.
-	inserted = ini_sections.emplace(*section, IniSection{}).second;
-	if (!inserted && !allow_duplicate_sections) {
-		IniWarning("WARNING: Duplicate section found in d3dx.ini: [%S]\n",
-				section->c_str());
+	// the behaviour of GetPrivateProfileString.
+	std::pair<IniSections::iterator, bool> result = ini_sections.emplace(*section, IniSection{});
+
+	if (!result.second && !allow_duplicate_sections) {
+		IniWarningW(L"Duplicate section found\n - [%ls]\n", section->c_str());
 		section->clear();
-		*section_vector = NULL;
 		return;
 	}
 
-	*section_vector = &ini_sections[*section].kv_vec;
+	IniSection* entry = &result.first->second;
+	*section_entry = entry;
 
 	// Record the namespace so we can use it later when looking up any
 	// referenced sections. Only for namespaced sections, not global
 	// sections:
 	if (namespaced_section) {
-		ini_sections[*section].ini_namespace = *ini_namespace;
+		entry->ini_namespace = *ini_namespace;
 		if (*ini_path != *ini_namespace)
-			ini_sections[*section].ini_path = *ini_path;
+			entry->ini_path = *ini_path;
 	}
 
 	// Sections that utilise a command list are allowed to have duplicate
 	// keys, while other sections are not. The command list parser will
-	// still check for duplicate keys that are not part of the command
-	// list.
+	// still check for duplicate keys that are not part of the command list.
 	if (IsCommandListSection(section->c_str())) {
 		if (*warn_duplicates == 1)
 			*warn_duplicates = 0;
 	} else if (!IsRegularSection(section->c_str())) {
-		IniWarning("WARNING: Unknown section in d3dx.ini: [%S]\n", section->c_str());
+		IniWarningW(L"Unknown section type\n - [%ls] @ [%ls]\n", section->c_str(), ini_namespace->c_str());
 	}
 
 	if (DoesSectionAllowLinesWithoutEquals(section->c_str()))
@@ -454,12 +461,12 @@ bool check_include_condition(wstring *val, const wstring *ini_namespace)
 	std::transform(sbuf.begin(), sbuf.end(), sbuf.begin(), ::towlower);
 
 	if (!condition.parse(&sbuf, ini_namespace, NULL)) {
-		IniWarning("WARNING: Unable to parse include condition: %S\n", val->c_str());
+		IniWarningW(L"Unable to parse include condition: %ls\n - [%ls]\n", val->c_str(), ini_namespace->c_str());
 		return false;
 	}
 
 	if (!condition.static_evaluate(&ret, NULL)) {
-		IniWarning("WARNING: Include condition could not be statically evaluated: %S\n", val->c_str());
+		IniWarningW(L"Include condition could not be statically evaluated: %ls\n - [%ls]\n", val->c_str(), ini_namespace->c_str());
 		return false;
 	}
 
@@ -497,22 +504,20 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
 		}
 	}
 
-	IniWarning("WARNING: d3dx.ini entry outside of section: %S\n",
-			wline->c_str());
+	IniWarningW(L"Entry outside of section: %ls\n - [%ls]\n", wline->c_str(), ini_namespace->c_str());
 	return true;
 }
 
 static void ParseIniKeyValLine(wstring *wline, wstring *section,
 		int warn_duplicates, bool warn_lines_without_equals,
-		IniSectionVector *section_vector, const wstring *ini_namespace)
+		IniSection *section_entry, const wstring *ini_namespace)
 {
 	size_t first, last, delim;
 	wstring key, val;
 	bool inserted;
 
-	if (section->empty() || section_vector == NULL) {
-		IniWarning("WARNING: d3dx.ini entry outside of section: %S\n",
-				wline->c_str());
+	if (section->empty() || section_entry == NULL) {
+		IniWarningW(L"Entry outside of section: %ls\n - [%ls]\n", wline->c_str(), ini_namespace->c_str());
 		return;
 	}
 
@@ -523,25 +528,26 @@ static void ParseIniKeyValLine(wstring *wline, wstring *section,
 		last = wline->find_last_not_of(L" \t", delim - 1);
 		key = wline->substr(0, last + 1);
 		first = wline->find_first_not_of(L" \t", delim + 1);
+
 		if (first != wline->npos)
 			val = wline->substr(first);
+		else {
+			IniWarningW(L"No value found for: \"%ls\"\n - [%ls] @ [%ls]\n", wline->c_str(), section->c_str(), ini_namespace->c_str());
+			return;
+		}
 
 		if (warn_duplicates == 2) {
 			// Recursively loaded config files are permitted to
 			// override values from the main d3dx.ini:
-			ini_sections.at(*section).kv_map[key] = val;
+			section_entry->kv_map[key] = val;
 		} else {
-			// We use "at" on the sections to access an existing
-			// section (alternatively we could use the [] operator
-			// to permit it to be created if it doesn't exist), but
-			// we use emplace within the section so that only the
-			// first item with a given key is inserted to match the
-			// behaviour of GetPrivateProfileString for duplicate
-			// keys within a single section:
-			inserted = ini_sections.at(*section).kv_map.emplace(key, val).second;
+			// Only the first item with a given key is inserted to
+			// match the behaviour of GetPrivateProfileString for
+			// duplicate keys within a single section:
+			inserted = section_entry->kv_map.emplace(key, val).second;
+
 			if ((warn_duplicates == 1) && !inserted && !whitelisted_duplicate_key(section->c_str(), key.c_str())) {
-				IniWarning("WARNING: Duplicate key found in d3dx.ini: [%S] %S\n",
-						section->c_str(), key.c_str());
+				IniWarningW(L"Duplicate key found: %ls\n - [%ls] @ [%ls]\n", key.c_str(), section->c_str(), ini_namespace->c_str());
 			}
 		}
 	} else {
@@ -550,21 +556,24 @@ static void ParseIniKeyValLine(wstring *wline, wstring *section,
 		// we will store it in the section vector structure for the
 		// profile parser to process.
 		if (warn_lines_without_equals) {
-			IniWarning("WARNING: Malformed line in d3dx.ini: [%S] \"%S\"\n",
-					section->c_str(), wline->c_str());
+			IniWarningW(L"Malformed line: \"%ls\"\n - [%ls] @ [%ls]\n", wline->c_str(), section->c_str(), ini_namespace->c_str());
 			return;
 		}
 	}
 
-	section_vector->emplace_back(key, val, *wline, *ini_namespace);
+	section_entry->kv_vec.emplace_back(key, val, *wline, *ini_namespace);
 }
 
-static void ParseIniStream(istream *stream, const wstring *_ini_namespace)
+static void ParseIniStream(wistream *stream, const wstring *_ini_namespace)
 {
 	string aline;
 	wstring wline, section, ini_path;
+
 	size_t first, last;
+	size_t line_start = 0;
 	IniSectionVector *section_vector = NULL;
+	IniSection* section_entry = NULL;
+
 	int warn_duplicates = 1;
 	bool warn_lines_without_equals = true;
 	wstring ini_namespace;
@@ -577,13 +586,7 @@ static void ParseIniStream(istream *stream, const wstring *_ini_namespace)
 		ini_namespace = L"";
 	ini_path = ini_namespace;
 
-	while (std::getline(*stream, aline)) {
-		// Convert to wstring for compatibility with GetPrivateProfile*
-		// APIs. If we assume the d3dx.ini is always ASCII we could
-		// drop this, but that would require us to change a great many
-		// types throughout 3DMigoto, so leave that for another day.
-		wline = wstring(aline.begin(), aline.end());
-
+	while (std::getline(*stream, wline)) {
 		// Strip preceding and trailing whitespace:
 		first = wline.find_first_not_of(L" \t");
 		last = wline.find_last_not_of(L" \t");
@@ -611,7 +614,7 @@ static void ParseIniStream(istream *stream, const wstring *_ini_namespace)
 			preamble = false;
 			ParseIniSectionLine(&wline, &section, &warn_duplicates,
 					    &warn_lines_without_equals,
-					    &section_vector, &ini_namespace,
+					    &section_entry, &ini_namespace,
 					    &ini_path);
 			continue;
 		}
@@ -623,14 +626,14 @@ static void ParseIniStream(istream *stream, const wstring *_ini_namespace)
 		}
 
 		ParseIniKeyValLine(&wline, &section, warn_duplicates,
-				   warn_lines_without_equals, section_vector,
+				   warn_lines_without_equals, section_entry,
 				   &ini_namespace);
 	}
 }
 
-static void ParseIniExcerpt(const char *excerpt)
+static void ParseIniExcerpt(const wchar_t *excerpt)
 {
-	std::istringstream stream(excerpt);
+	std::wistringstream stream(excerpt);
 
 	ParseIniStream(&stream, NULL);
 }
@@ -655,12 +658,12 @@ static void ParseIniExcerpt(const char *excerpt)
 // it, make sure you delay calling it until after the log file has been opened!
 static void ParseNamespacedIniFile(const wchar_t *ini, const wstring *ini_namespace)
 {
-	ifstream f(ini, ios::in, _SH_DENYNO);
+	wifstream f(ini, ios::in, _SH_DENYNO);
 	if (!f) {
 		LogOverlay(LOG_WARNING, "  Error opening %S\n", ini);
 		return;
 	}
-
+	f.imbue(std::locale(f.getloc(), new std::codecvt_utf8<wchar_t, 0x10ffff, std::consume_header>));
 	ParseIniStream(&f, ini_namespace);
 }
 
@@ -673,29 +676,29 @@ static void ParseIniFile(const wchar_t *ini)
 
 static void InsertBuiltInIniSections()
 {
-	static const char text[] =
-		"[BuiltInCustomShaderDisableScissorClipping]\n"
-		"scissor_enable = false\n"
-		"rasterizer_state_merge = true\n"
-		"draw = from_caller\n"
-		"handling = skip\n"
+	static const wchar_t text[] =
+		L"[BuiltInCustomShaderDisableScissorClipping]\n"
+		L"scissor_enable = false\n"
+		L"rasterizer_state_merge = true\n"
+		L"draw = from_caller\n"
+		L"handling = skip\n"
 
-		"[BuiltInCustomShaderEnableScissorClipping]\n"
-		"scissor_enable = true\n"
-		"rasterizer_state_merge = true\n"
-		"draw = from_caller\n"
-		"handling = skip\n"
+		L"[BuiltInCustomShaderEnableScissorClipping]\n"
+		L"scissor_enable = true\n"
+		L"rasterizer_state_merge = true\n"
+		L"draw = from_caller\n"
+		L"handling = skip\n"
 
-		"[BuiltInCommandListUnbindAllRenderTargets]\n"
-		"o0 = null\n"
-		"o1 = null\n"
-		"o2 = null\n"
-		"o3 = null\n"
-		"o4 = null\n"
-		"o5 = null\n"
-		"o6 = null\n"
-		"o7 = null\n"
-		"oD = null\n"
+		L"[BuiltInCommandListUnbindAllRenderTargets]\n"
+		L"o0 = null\n"
+		L"o1 = null\n"
+		L"o2 = null\n"
+		L"o3 = null\n"
+		L"o4 = null\n"
+		L"o5 = null\n"
+		L"o6 = null\n"
+		L"o7 = null\n"
+		L"oD = null\n"
 	;
 
 	ParseIniExcerpt(text);
@@ -744,6 +747,17 @@ static void free_globbing_vector(vector<pcre2_code*> &patterns) {
 		pcre2_code_free(regex);
 }
 
+static string to_utf8(const wstring& wstr) {
+	if (wstr.empty())
+		return string();
+	int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+	if (len == 0)
+		return string();
+	string utf8_str(len, 0);
+	WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &utf8_str[0], len, NULL, NULL);
+	return utf8_str;
+}
+
 static bool matches_globbing_vector(wchar_t *filename, vector<pcre2_code*> &patterns) {
 	string afilename;
 	pcre2_match_data *md;
@@ -754,8 +768,7 @@ static bool matches_globbing_vector(wchar_t *filename, vector<pcre2_code*> &patt
 	// eliminate all unecessary uses of wchar_t/wstring). Since this is a
 	// filename, it can contain legitimate unicode characters, so we should
 	// convert it properly to UTF8:
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> codec;
-	afilename = codec.to_bytes(filename); // to_bytes = to utf8
+	afilename = to_utf8(filename); // Replaced deprecated wstring_convert with custom optimized function
 
 	for (pcre2_code *regex : patterns) {
 		md = pcre2_match_data_create_from_pattern(regex, NULL);
@@ -846,6 +859,21 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
 	return _GetIniSection(&ini_sections, key_vals, section);
 }
 
+const std::wstring& GetIniSectionNamespace(const wchar_t* section)
+{
+	auto it = ini_sections.find(section);
+
+	if (it != ini_sections.end() && !it->second.ini_namespace.empty())
+		return it->second.ini_namespace;
+
+	return G->gDefaultNamespace;
+}
+
+const std::wstring& GetIniNamespace(const wchar_t* section, const wstring* override)
+{
+	return override ? *override : GetIniSectionNamespace(section);
+}
+
 // This emulates the behaviour of the old GetPrivateProfileString API to
 // facilitate switching to our own ini parser. Later we might consider changing
 // the return values (e.g. return found/not found instead of string length),
@@ -853,30 +881,39 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
 // Note that it is the only GetIni...() function that does not perform any
 // automatic logging of present values
 int GetIniString(const wchar_t *section, const wchar_t *key, const wchar_t *def,
-		 wchar_t *ret, unsigned size)
+	wchar_t *ret, unsigned size)
 {
 	int rc;
+	bool found = false;
 
-	try {
-		wstring &val = ini_sections.at(section).kv_map.at(key);
-		// Note that we now use wcsncpy_s here with _TRUNCATE rather
-		// than wcscpy_s, because it turns out the later may just kill
-		// us immediately on overflow depending on the invalid
-		// parameter handler (refer to issue #84), and this way we more
-		// closely match the behaviour of GetPrivateProfileString.
-		if (wcsncpy_s(ret, size, val.c_str(), _TRUNCATE)) {
-			// Funky return code of GetPrivateProfileString Not
-			// sure if we depend on this - if we don't I'd like a
-			// nicer return code or to raise an exception.
-			IniWarning("WARNING: [%S] \"%S=%S\" too long\n",
-					section, key, val.c_str());
-			rc = size - 1;
-		} else {
-			// I'd also rather not have to calculate the string
-			// length if we don't use it
-			rc = (int)wcslen(ret);
+	auto ini_section = ini_sections.find(section);
+
+	// Switch from try-catch to more explicit and efficient checks
+	if (ini_section != ini_sections.end()) {
+		auto& kv_map = ini_section->second.kv_map;
+		auto kv_pair = kv_map.find(key);
+		if (kv_pair != kv_map.end()) {
+			const std::wstring& val = kv_pair->second;
+			// Note that we now use wcsncpy_s here with _TRUNCATE rather
+			// than wcscpy_s, because it turns out the later may just kill
+			// us immediately on overflow depending on the invalid
+			// parameter handler (refer to issue #84), and this way we more
+			// closely match the behaviour of GetPrivateProfileString.
+			if (wcsncpy_s(ret, size, val.c_str(), _TRUNCATE)) {
+				// Funky return code of GetPrivateProfileString Not
+				// sure if we depend on this - if we don't I'd like a
+				// nicer return code or to raise an exception.
+				IniWarningW(L"\"%ls=%ls\" too long\n - [%ls]\n", key, val.c_str(), section);
+				rc = size - 1;
+			} else {
+				// I'd also rather not have to calculate the string
+				// length if we don't use it
+				rc = (int)wcslen(ret);
+			}
+			found = true;
 		}
-	} catch (std::out_of_range) {
+	}
+	if (!found) {
 		if (def) {
 			if (wcscpy_s(ret, size, def)) {
 				// If someone passed in a default value that is
@@ -910,10 +947,17 @@ bool GetIniString(const wchar_t *section, const wchar_t *key, const wchar_t *def
 		DoubleBeepExit();
 	}
 
-	try {
-		wret = ini_sections.at(section).kv_map.at(key);
-		found = true;
-	} catch (std::out_of_range) {
+	// Switch from try-catch to more explicit and efficient checks
+	auto ini_section = ini_sections.find(section);
+	if (ini_section != ini_sections.end()) {
+		auto& kv_map = ini_section->second.kv_map;
+		auto kv_pair = kv_map.find(key);
+		if (kv_pair != kv_map.end()) {
+			wret = kv_pair->second;
+			found = true;
+		}
+	}
+	if (!found) {
 		if (def)
 			wret = def;
 		else
@@ -955,6 +999,7 @@ int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
 
 	return rc;
 }
+
 static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
 		const wchar_t *def, std::string *ret)
 {
@@ -966,82 +1011,285 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
 	return rc;
 }
 
-
-float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *found)
+const wstring* GetIniWstring(const wchar_t* section, const wchar_t* key)
 {
-	wchar_t val[32];
-	float ret = def;
-	int len;
+	auto section_it = ini_sections.find(section);
+	if (section_it == ini_sections.end())
+		return nullptr;
 
-	if (found)
-		*found = false;
+	auto value_it = section_it->second.kv_map.find(key);
+	if (value_it == section_it->second.kv_map.end())
+		return nullptr;
 
-	if (GetIniString(section, key, 0, val, 32)) {
-		swscanf_s(val, L"%f%n", &ret, &len);
-		if (len != wcslen(val)) {
-			IniWarning("WARNING: Floating point parse error: %S=%S\n", key, val);
-		} else {
-			if (found)
-				*found = true;
-			LogInfo("  %S=%f\n", key, ret);
-		}
-	}
-
-	return ret;
+	return &value_it->second;
 }
 
-int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found, bool warn)
+inline std::wstring NormalizeString(const std::wstring& value)
 {
-	wchar_t val[32];
-	int ret = def;
-	int len;
-
-	if (found)
-		*found = false;
-
-	// Not using GetPrivateProfileInt as it doesn't tell us if the key existed
-	if (GetIniString(section, key, 0, val, 32)) {
-		swscanf_s(val, L"%d%n", &ret, &len);
-		if (len != wcslen(val)) {
-			if (warn)
-				IniWarning("WARNING: Integer parse error: %S=%S\n", key, val);
-		} else {
-			if (found)
-				*found = true;
-			LogInfo("  %S=%d\n", key, ret);
-		}
-	}
-
-	return ret;
+	std::wstring normalized = value;
+	std::transform(normalized.begin(), normalized.end(), normalized.begin(), towlower);
+	return normalized;
 }
 
-bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *found, bool warn)
+bool ParseBinaryLiterals(const wstring& input, size_t start, uint64_t& out, size_t& length)
 {
-	wchar_t val[32];
-	bool ret = def;
+	uint64_t value = 0;
+	length = 0;
 
-	if (found)
-		*found = false;
+	for (; start < input.size(); ++start, ++length)
+	{
+		const wchar_t c = input[start];
 
-	if (GetIniString(section, key, 0, val, 32)) {
-		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
-			LogInfo("  %S=1\n", key);
-			if (found)
-				*found = true;
-			return true;
-		}
-		if (!_wcsicmp(val, L"0") || !_wcsicmp(val, L"false") || !_wcsicmp(val, L"no") || !_wcsicmp(val, L"off")) {
-			LogInfo("  %S=0\n", key);
-			if (found)
-				*found = true;
+		if (c != L'0' && c != L'1')
+			break;
+
+		// uint64_t can hold at most 64 binary digits.
+		if (length >= 64)
 			return false;
-		}
 
-		if (warn)
-			IniWarning("WARNING: Boolean parse error: %S=%S\n", key, val);
+		value <<= 1;
+
+		if (c == L'1')
+			value |= 1;
 	}
 
-	return ret;
+	if (length == 0)
+		return false;
+
+	out = value;
+	return true;
+}
+
+template<typename T, typename Converter>
+bool ParseIniExpression(
+	const wstring* ini_namespace_override,
+	const wchar_t* section,
+	const wchar_t* key,
+	const wstring& value,
+	T& out,
+	bool warn,
+	Converter&& convert,
+	bool normalize = true)
+{
+	const wstring& ini_namespace = GetIniNamespace(section, ini_namespace_override);
+
+	// Expression parsing is case-insensitive.
+	const wstring& expression_text = normalize ? NormalizeString(value) : value;
+
+	CommandListExpression expression;
+
+	if (!expression.parse(&expression_text, &ini_namespace, nullptr))
+	{
+		if (warn)
+		{
+			IniWarningW(
+				L"Unable to parse %ls expression for \"%ls\": \"%ls\"\n"
+				L" - [%ls] @ [%ls]\n",
+				IniValueTypeName<T>::value, key, value.c_str(),
+				section, ini_namespace.c_str());
+		}
+		return false;
+	}
+
+	float expression_value;
+
+	if (!expression.static_evaluate(&expression_value, nullptr, true))
+	{
+		if (warn)
+		{
+			IniWarningW(
+				L"%ls expression for \"%ls\" cannot be statically evaluated: \"%ls\"\n"
+				L" - [%ls] @ [%ls]\n",
+				IniValueTypeName<T>::value, key, value.c_str(),
+				section, ini_namespace.c_str());
+		}
+		return false;
+	}
+
+	if (!convert(expression_value, out))
+	{
+		if (warn)
+		{
+			IniWarningW(
+				L"Expression result \"%f\" for \"%ls\" %ls conversion is invalid: \"%ls\"\n"
+				L" - [%ls] @ [%ls]\n",
+				expression_value, key, IniValueTypeName<T>::value, value.c_str(),
+				section, ini_namespace.c_str());
+		}
+		return false;
+	}
+
+	return true;
+}
+
+inline void SetFound(bool* found, bool value) noexcept
+{
+	if (found)
+		*found = value;
+}
+
+template<typename T, typename Parser, typename Logger>
+T GetIniValue(
+	const wchar_t* section,
+	const wchar_t* key,
+	T def,
+	bool* found,
+	bool warn,
+	Parser&& parser,
+	Logger&& logger)
+{
+	SetFound(found, false);
+
+	const wstring* val = GetIniWstring(section, key);
+	if (!val)
+		return def;
+
+	if (val->empty())
+	{
+		if (warn)
+		{
+			IniWarningW(
+				L"Unable to parse %ls value for \"%ls\" from empty string\n"
+				L" - [%ls] @ [%ls]\n",
+				IniValueTypeName<T>::value, key,
+				section, GetIniSectionNamespace(section).c_str());
+		}
+		return def;
+	}
+
+	T result{};
+	if (!parser(section, key, *val, result, warn, nullptr))
+		return def;
+
+	SetFound(found, true);
+
+	logger(key, result);
+
+	return result;
+}
+
+inline bool ConvertExpressionToFloat(float expr, float& out) noexcept
+{
+	// Preserve the evaluated IEEE-754 value, including NaN and ±infinity.
+	out = expr;
+	return true;
+}
+
+bool ParseFloatValue(const wchar_t* section, const wchar_t* key, const wstring& val, float& out, bool warn = true, const wstring* ini_namespace_override = nullptr)
+{
+	wchar_t* end = nullptr;
+	errno = 0;
+	out = std::wcstof(val.c_str(), &end); // TODO: C++17: use std::from_chars.
+	
+	if (*end == L'\0')
+	{
+		if (errno == ERANGE)
+		{
+			// Treat floating-point overflow as ±infinity.
+			out = std::signbit(out) ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+		}
+		return true;
+	}
+
+	return ParseIniExpression(ini_namespace_override, section, key, val, out, warn, ConvertExpressionToFloat);
+}
+
+inline void LogIniFloat(const wchar_t* key, float value)
+{
+	LogInfoW(L"  %ls=%f\n", key, value);
+}
+
+float GetIniFloat(const wchar_t* section, const wchar_t* key, float def, bool* found)
+{
+	return GetIniValue(section, key, def, found, true, ParseFloatValue, LogIniFloat);
+}
+
+inline bool ConvertExpressionToInt(float expr, int& out) noexcept
+{
+	// Saturate infinities and out-of-range values. Map NaN to zero.
+	if (std::isnan(expr))
+		out = 0;
+	else if (expr <= static_cast<float>(INT_MIN))
+		out = INT_MIN;
+	else if (expr >= static_cast<float>(INT_MAX))
+		out = INT_MAX;
+	else
+		out = static_cast<int>(expr);
+
+	return true;
+}
+
+bool ParseIntValue(const wchar_t* section, const wchar_t* key, const wstring& val, int& out, bool warn = false, const wstring* ini_namespace_override = nullptr)
+{
+	wchar_t* end = nullptr;
+	errno = 0;
+	long long n = std::wcstoll(val.c_str(), &end, 10); // TODO: C++17: use std::from_chars
+	
+	if (*end == L'\0') {
+		if (errno == ERANGE)
+		{
+			// Saturate integer literal overflow.
+			out = (n < 0) ? INT_MIN : INT_MAX;
+		}
+		else
+		{
+			if (n < INT_MIN)
+				out = INT_MIN;
+			else if (n > INT_MAX)
+				out = INT_MAX;
+			else
+				out = static_cast<int>(n);
+		}
+		return true;
+	}
+
+	return ParseIniExpression(ini_namespace_override, section, key, val, out, warn, ConvertExpressionToInt);
+}
+
+inline void LogIniInt(const wchar_t* key, int value)
+{
+	LogInfoW(L"  %ls=%d\n", key, value);
+}
+
+int GetIniInt(const wchar_t* section, const wchar_t* key, int def, bool* found, bool warn)
+{
+	return GetIniValue<int>(section, key, def, found, warn, ParseIntValue, LogIniInt);
+}
+
+inline bool ConvertExpressionToBool(float expr, bool& out) noexcept
+{
+	// NaN is false; all other non-zero values (including ±infinity) are true.
+	out = !std::isnan(expr) && expr != 0.0f;
+	return true;
+}
+
+bool ParseBoolValue(const wchar_t* section, const wchar_t* key, const wstring& val, bool& out, bool warn = false, const wstring* ini_namespace_override = nullptr)
+{
+	wstring normalized = NormalizeString(val);
+
+	if (normalized == L"1" || normalized == L"true" || normalized == L"yes" || normalized == L"on")
+	{
+		out = true;
+		return true;
+	}
+
+	if (normalized == L"0" || normalized == L"false" || normalized == L"no" || normalized == L"off")
+	{
+		out = false;
+		return true;
+	}
+
+	return ParseIniExpression(ini_namespace_override, section, key, normalized, out, warn, ConvertExpressionToBool, false);
+}
+
+inline void LogIniBool(const wchar_t* key, bool value)
+{
+	LogInfoW(L"  %ls=%d\n", key, value ? 1 : 0);
+}
+
+bool GetIniBool(const wchar_t* section, const wchar_t* key, bool def, bool* found, bool warn)
+{
+	return GetIniValue<bool>(section, key, def, found, warn, ParseBoolValue, LogIniBool);
 }
 
 static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def, bool *found)
@@ -1054,9 +1302,10 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
 		*found = false;
 
 	if (GetIniString(section, key, NULL, &val)) {
-		sscanf_s(val.c_str(), "%16llx%n", &ret, &len);
-		if (len != val.length()) {
-			IniWarning("WARNING: Hash parse error: %S=%s\n", key, val.c_str());
+		if (sscanf_s(val.c_str(), "%16llx%n", &ret, &len) != 1 || len != val.length()) {
+			wstring ini_namespace = ini_sections[section].ini_namespace;
+			IniWarningW(L"Hash parse error: %ls=%S\n - [%ls] @ [%ls]\n", key, val.c_str(), section, ini_namespace.c_str());
+			ret = def;
 		} else {
 			if (found)
 				*found = true;
@@ -1077,9 +1326,10 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def, 
 		*found = false;
 
 	if (GetIniString(section, key, NULL, &val)) {
-		sscanf_s(val.c_str(), "%x%n", &ret, &len);
-		if (len != val.length()) {
-			IniWarning("WARNING: Hex string parse error: %S=%s\n", key, val.c_str());
+		if (sscanf_s(val.c_str(), "%x%n", &ret, &len) != 1 || len != val.length()) {
+			wstring ini_namespace = ini_sections[section].ini_namespace;
+			IniWarningW(L"Hex string parse error: %ls=%S\n - [%ls] @ [%ls]\n", key, val.c_str(), section, ini_namespace.c_str());
+			ret = def;
 		} else {
 			if (found)
 				*found = true;
@@ -1129,7 +1379,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool 
 				*found = true;
 			LogInfo("  %S=%S\n", key, val);
 		} catch (EnumParseError) {
-			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
+			IniWarningW(L"Unrecognised Enum: %ls=%ls\n - [%ls]\n", key, val, section);
 		}
 	}
 
@@ -1157,7 +1407,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
 				*found = tmp_found;
 			LogInfo("  %S=%S\n", key, val);
 		} else {
-			IniWarning("WARNING: Unknown %S=%S\n", key, val);
+			IniWarningW(L"Unknown Enum: %ls=%ls\n - [%ls]\n", key, val, section);
 		}
 	}
 
@@ -1190,7 +1440,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
 				*found = tmp_found;
 			LogInfo("  %S=%s\n", key, val.c_str());
 		} else {
-			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
+			IniWarningW(L"Unknown Enum: %ls=%S\n - [%ls]\n", key, val.c_str(), section);
 		}
 	}
 
@@ -1232,14 +1482,15 @@ static int GetIniBoolIntOrEnum(const wchar_t *section, const wchar_t *key, int d
 	int ret;
 	bool tmp_found;
 
-	ret = GetIniBoolOrInt(section, key, def, &tmp_found);
+	ret = GetIniEnum(section, key, def, &tmp_found, prefix, names, names_len, first);
+
 	if (tmp_found && ret >= 0 && ret < names_len) {
 		if (found)
 			*found = tmp_found;
 		return ret;
 	}
 
-	return GetIniEnum(section, key, def, found, prefix, names, names_len, first);
+	return GetIniBoolOrInt(section, key, def, found);
 }
 
 static void GetUserConfigPath(const wchar_t *migoto_path)
@@ -1259,7 +1510,7 @@ static void ParseIncludedIniFiles()
 {
 	IniSections include_sections;
 	IniSections::iterator lower, upper, i;
-	const wchar_t *section_id;
+	const wstring *section_id;
 	IniSectionVector *section = NULL;
 	IniSectionVector::iterator entry;
 	wstring *key, *val;
@@ -1267,7 +1518,8 @@ static void ParseIncludedIniFiles()
 	wstring namespace_path, rel_path, ini_path;
 	wchar_t migoto_path[MAX_PATH];
 	vector<pcre2_code*> exclude;
-	DWORD attrib;
+
+	recursive_includes.clear();
 
 	GetModuleFileName(migoto_handle, migoto_path, MAX_PATH);
 	wcsrchr(migoto_path, L'\\')[1] = 0;
@@ -1295,15 +1547,17 @@ static void ParseIncludedIniFiles()
 		ini_sections.erase(lower, upper);
 
 		for (i = include_sections.begin(); i != include_sections.end(); i++) {
-			section_id = i->first.c_str();
-			LogInfo("[%S]\n", section_id);
+			section_id = &i->first;
+			LogInfo("[%S]\n", section_id->c_str());
 
-			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
+			_get_namespaced_section_path(&include_sections, section_id->c_str(), &namespace_path);
 
-			_GetIniSection(&include_sections, &section, section_id);
+			_GetIniSection(&include_sections, &section, section_id->c_str());
+
 			for (entry = section->begin(); entry < section->end(); entry++) {
 				key = &entry->first;
 				val = &entry->second;
+
 				LogInfo("  %S=%S\n", key->c_str(), val->c_str());
 
 				rel_path = namespace_path + *val;
@@ -1311,34 +1565,68 @@ static void ParseIncludedIniFiles()
 				// This is not a strong protection against including the same file multiple times,
 				// but it is intended to ensure that this do while loop will eventually terminate.
 				if (seen.count(rel_path)) {
-					IniWarning("WARNING: File included multiple times: %S\n", rel_path.c_str());
+					IniWarningW(L"File included multiple times: %ls\n - [%ls]\n", rel_path.c_str(), section_id->c_str());
 					continue;
 				}
+
 				seen.insert(rel_path);
 
-				if (!wcscmp(key->c_str(), L"include")) {
-					ini_path = wstring(migoto_path) + rel_path;
-					ParseNamespacedIniFile(ini_path.c_str(), &rel_path);
-				} else if (!wcscmp(key->c_str(), L"include_recursive")) {
-					ParseIniFilesRecursive(migoto_path, rel_path, exclude);
-				} else if (!wcscmp(key->c_str(), L"exclude_recursive")) {
-					// Handled above
-				} else if (!wcscmp(key->c_str(), L"user_config")) {
-					// Handled below
-				} else {
-					IniWarning("WARNING: Unrecognised entry: %S=%S\n", key->c_str(), rel_path.c_str());
+				switch (key->size())
+				{
+				case 7: // include
+					if (!wcscmp(key->c_str(), L"include")) {
+						ini_path = wstring(migoto_path) + rel_path;
+						ParseNamespacedIniFile(ini_path.c_str(), &rel_path);
+						continue;
+					}
+					break;
+
+				case 11: // user_config
+					if (!wcscmp(key->c_str(), L"user_config")) {
+						// Handled below
+						continue;
+					}
+					break;
+
+				case 17: // include_recursive / exclude_recursive
+					if (key->c_str()[0] == L'i') {
+						if (!wcscmp(key->c_str(), L"include_recursive")) {
+							ParseIniFilesRecursive(migoto_path, rel_path, exclude);
+							continue;
+						}
+					}
+					else if (key->c_str()[0] == L'e') {
+						if (!wcscmp(key->c_str(), L"exclude_recursive")) {
+							// Handled above
+							continue;
+						}
+					}
+					break;
 				}
+
+				IniWarningW(L"Unrecognised entry: %ls=%ls\n - [%ls] @ [%ls]\n",
+					key->c_str(), val->c_str(), section_id->c_str(), namespace_path.c_str());
 			}
 		}
 	} while (!include_sections.empty());
 
 	free_globbing_vector(exclude);
+}
 
-	// User config is loaded very last to allow it to override all other
-	// ini files.
-	attrib = GetFileAttributes(G->user_config.c_str());
-	if (attrib != INVALID_FILE_ATTRIBUTES)
-		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
+static void ParsePersistentSettings()
+{
+	DWORD attrib = GetFileAttributes(G->user_config.c_str());
+	if (attrib == INVALID_FILE_ATTRIBUTES)
+		return;
+	ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
+}
+
+bool starts_with_any(const std::wstring& str, const std::unordered_set<std::wstring>& prefixes)
+{
+	return std::any_of(prefixes.begin(), prefixes.end(),
+		[&](const std::wstring& prefix) {
+			return str.compare(0, prefix.size(), prefix) == 0;
+		});
 }
 
 static void RegisterPresetKeyBindings()
@@ -1361,7 +1649,7 @@ static void RegisterPresetKeyBindings()
 		keys = GetIniStringMultipleKeys(id, L"Key");
 		back = GetIniStringMultipleKeys(id, L"Back");
 		if (keys.empty() && back.empty()) {
-			IniWarning("WARNING: [%S] missing Key=\n", id);
+			IniWarningW(L"Missing Key=\n - [%ls]\n", id);
 			continue;
 		}
 
@@ -1370,12 +1658,16 @@ static void RegisterPresetKeyBindings()
 		delay = GetIniInt(id, L"delay", 0, NULL);
 		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
 
+		// Only keys declared by INIs from "recursive_includes" paths should be disabled by "input_disable_mode = mods".
+		bool is_mod = starts_with_any(i->second.ini_path.empty() ? i->second.ini_namespace : i->second.ini_path, recursive_includes);
+		InputDisableScope input_disable_scope = is_mod ? InputDisableScope::MODS : InputDisableScope::ALL;
+
 		if (type == KeyOverrideType::CYCLE) {
 			shared_ptr<KeyOverrideCycle> cycle_preset = make_shared<KeyOverrideCycle>();
 			shared_ptr<KeyOverrideCycleBack> cycle_back = make_shared<KeyOverrideCycleBack>(cycle_preset);
 			preset = cycle_preset;
 			for (wstring key : back)
-				RegisterKeyBinding(L"Back", key.c_str(), cycle_back, 0, delay, release_delay);
+				RegisterKeyBinding(L"Back", key.c_str(), cycle_back, 0, delay, release_delay, input_disable_scope);
 		} else {
 			preset = make_shared<KeyOverride>(type);
 		}
@@ -1383,7 +1675,7 @@ static void RegisterPresetKeyBindings()
 		preset->ParseIniSection(id);
 
 		for (wstring key : keys)
-			RegisterKeyBinding(L"Key", key.c_str(), preset, 0, delay, release_delay);
+			RegisterKeyBinding(L"Key", key.c_str(), preset, 0, delay, release_delay, input_disable_scope);
 	}
 }
 
@@ -1490,7 +1782,7 @@ static std::vector<T> string_to_typed_array(std::istringstream *tokens)
 			continue;
 		}
 
-		IniWarning("WARNING: Parse error: %s\n", token.c_str());
+		IniWarningW(L"String-to-typed-array parse error: %S\n", token.c_str());
 	}
 
 	return list;
@@ -1546,15 +1838,15 @@ static void ConstructInitialDataNorm(CustomResource *custom_resource, std::istri
 		val = vals[i];
 
 		if (isnan(val)) {
-			IniWarning("WARNING: Special value unsupported as normalized integer: %f\n", val);
+			IniWarning("Special value unsupported as normalized integer: %f\n", val);
 			val = 0;
 		} else if (snorm) {
 			if (val < -1.0 || val > 1.0)
-				IniWarning("WARNING: Value out of [-1, +1] range: %f\n", val);
+				IniWarning("Value out of [-1, +1] range: %f\n", val);
 			val = max(min(val, 1.0f), -1.0f);
 		} else {
 			if (val < 0.0 || val > 1.0)
-				IniWarning("WARNING: Value out of [0, +1] range: %f\n", val);
+				IniWarning("Value out of [0, +1] range: %f\n", val);
 			val = max(min(val, 1.0f), 0.0f);
 		}
 
@@ -1594,7 +1886,7 @@ static void ConstructInitialDataString(CustomResource *custom_resource, std::str
 		memcpy(custom_resource->initial_data, data->c_str() + 1, custom_resource->initial_data_size);
 		return;
 	default:
-		IniWarning("WARNING: unsupported format for specifying initial data as text\n");
+		IniWarning("Unsupported format for specifying initial data as text\n");
 		return;
 	}
 }
@@ -1617,13 +1909,13 @@ static void ParseResourceInitialData(CustomResource *custom_resource, const wcha
 		case CustomResourceType::RAW_BUFFER:
 			break;
 		default:
-			IniWarning("WARNING: initial data currently only supported on buffers\n");
+			IniWarningW(L"Initial data currently only supported on buffers\n - [%ls]\n", section);
 			// TODO: Support Textures as well (remember to fill out row/depth pitch)
 			return;
 	}
 
 	if (!custom_resource->filename.empty()) {
-		IniWarning("WARNING: initial data and filename cannot be used together\n");
+		IniWarningW(L"Initial data and filename cannot be used together\n - [%ls]\n", section);
 		return;
 	}
 
@@ -1737,100 +2029,180 @@ static void ParseResourceInitialData(CustomResource *custom_resource, const wcha
 	// TODO: case DXGI_FORMAT_R1_UNORM:
 
 	default:
-		IniWarning("WARNING: unsupported format for specifying initial data\n");
+		IniWarningW(L"Unsupported format %S for specifying initial data\n - [%ls]\n", token.c_str(), section);
 		return;
 	}
 }
 
+static CustomResource* ParseResourceSection(const wchar_t* section_name, const wchar_t* resource_id_suffix)
+{
+	wchar_t setting[MAX_PATH];
+
+	wstring resource_id(section_name);
+	if (resource_id_suffix != nullptr) {
+		resource_id += L"_";
+		resource_id += resource_id_suffix;
+	}
+
+	// Convert section name to lower case so our keys will be consistent in the unordered_map:
+	std::transform(resource_id.begin(), resource_id.end(), resource_id.begin(), ::towlower);
+
+	// Empty Resource sections are valid (think of them as a
+	// sort of variable declaration), so explicitly construct a
+	// CustomResource for each one. Use the [] operator so the
+	// default constructor will be used:
+	CustomResource* custom_resource = &customResources[resource_id];
+	custom_resource->name = resource_id;
+	custom_resource->pool_index = -2;
+
+	custom_resource->max_copies_per_frame = GetIniInt(section_name, L"max_copies_per_frame", 0, NULL);
+
+	if (GetIniStringAndLog(section_name, L"filename", 0, setting, MAX_PATH)) {
+		// If this section was not in the main d3dx.ini, look
+		// for a file relative to the config it came from
+		// first, then try relative to the 3DMigoto directory:
+		wstring namespace_path;
+		get_namespaced_section_path(section_name, &namespace_path);
+		bool found = false;
+		wchar_t path[MAX_PATH];
+		if (!namespace_path.empty()) {
+			GetModuleFileName(migoto_handle, path, MAX_PATH);
+			wcsrchr(path, L'\\')[1] = 0;
+			wcscat(path, namespace_path.c_str());
+			wcscat(path, setting);
+			if (GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES)
+				found = true;
+		}
+		if (!found) {
+			GetModuleFileName(migoto_handle, path, MAX_PATH);
+			wcsrchr(path, L'\\')[1] = 0;
+			wcscat(path, setting);
+		}
+		custom_resource->filename = path;
+	}
+
+	custom_resource->override_type = GetIniEnumClass(section_name, L"type", CustomResourceType::INVALID, NULL, CustomResourceTypeNames);
+
+	if (GetIniString(section_name, L"format", 0, setting, MAX_PATH)) {
+		custom_resource->override_format = ParseFormatString(setting, true);
+		if (custom_resource->override_format == (DXGI_FORMAT)-1) {
+			IniWarningW(L"Unknown format \"%ls\"\n - [%ls]\n", setting, section_name);
+		} else {
+			LogInfo("  format=%s\n", TexFormatStr(custom_resource->override_format));
+		}
+	}
+
+	custom_resource->override_color_space = GetIniEnumClass(section_name, L"color_space", CustomColorSpace::DEFAULT, NULL, CustomColorSpaceNames);
+	custom_resource->override_width = GetIniInt(section_name, L"width", -1, NULL);
+	custom_resource->override_height = GetIniInt(section_name, L"height", -1, NULL);
+	custom_resource->override_depth = GetIniInt(section_name, L"depth", -1, NULL);
+	custom_resource->override_mips = GetIniInt(section_name, L"mips", -1, NULL);
+	custom_resource->override_array = GetIniInt(section_name, L"array", -1, NULL);
+	custom_resource->override_msaa = GetIniInt(section_name, L"msaa", -1, NULL);
+	custom_resource->override_msaa_quality = GetIniInt(section_name, L"msaa_quality", -1, NULL);
+	custom_resource->override_byte_width = GetIniInt(section_name, L"byte_width", -1, NULL);
+	custom_resource->override_stride = GetIniInt(section_name, L"stride", -1, NULL);
+
+	custom_resource->width_multiply = GetIniFloat(section_name, L"width_multiply", 1.0f, NULL);
+	custom_resource->height_multiply = GetIniFloat(section_name, L"height_multiply", 1.0f, NULL);
+
+	if (GetIniStringAndLog(section_name, L"bind_flags", 0, setting, MAX_PATH)) {
+		custom_resource->override_bind_flags = parse_enum_option_string<const wchar_t*, CustomResourceBindFlags, wchar_t*>
+			(CustomResourceBindFlagNames, setting, NULL);
+	}
+
+	if (GetIniStringAndLog(section_name, L"misc_flags", 0, setting, MAX_PATH)) {
+		custom_resource->override_misc_flags = parse_enum_option_string<const wchar_t*, ResourceMiscFlags, wchar_t*>
+			(ResourceMiscFlagNames, setting, NULL);
+	}
+
+	ParseResourceInitialData(custom_resource, section_name);
+
+	return custom_resource;
+}
+
+static CustomResourcePool* ParseResourcePoolSection(const wchar_t* section_name)
+{
+	int pool_size = GetIniInt(section_name, L"pool_size", 1, NULL);
+
+	if (pool_size < 1)
+		return nullptr;
+
+	wstring pool_id = section_name;
+	std::transform(pool_id.begin(), pool_id.end(), pool_id.begin(), ::towlower);
+
+	CustomResourcePool* pool = &customResourcePools[pool_id];
+
+	pool->name = pool_id;
+
+	pool->index_type = GetIniEnumClass(section_name, L"pool_index_type", PoolIndexType::RING, NULL, PoolIndexTypeNames);
+	pool->lazy_initialization = GetIniBool(section_name, L"pool_lazy_initialization", true, NULL);
+	pool->element_type_switch_reset = GetIniBool(section_name, L"pool_element_type_switch_reset", true, NULL);
+	pool->allocate_slot_on_missing = GetIniBool(section_name, L"pool_allocate_slot_on_missing", false, NULL);
+	
+	int expiration_timeout_frames = GetIniInt(section_name, L"pool_expiration_timeout_frames", -1, NULL);
+	if (expiration_timeout_frames >= 0)
+		pool->expiration_timeout_frames = (unsigned)expiration_timeout_frames;
+	pool->reset_expired_elements = GetIniBool(section_name, L"pool_expiration_reset_elements", true, NULL);
+	pool->read_refreshes_expiration = GetIniBool(section_name, L"pool_expiration_refresh_on_read", false, NULL);
+	
+	int spatial_radius = GetIniInt(section_name, L"pool_spatial_radius", 1, NULL);
+	if (spatial_radius < 1) {
+		IniWarningW(L"Specified spatial radius \"%d\" is below minimum \"1\".\n - [%ls]\n", spatial_radius, pool->name.c_str());
+		spatial_radius = 1;
+	}
+	pool->spatial_radius = spatial_radius;
+
+	pool->resource_template = ParseResourceSection(section_name, L"template");
+
+	pool->resource_template->pool = pool;
+	pool->resource_template->pool_index = -1;
+
+	bool persist_variables = GetIniBool(section_name, L"pool_persist_variables", false, NULL);
+	if (persist_variables && pool->index_type != PoolIndexType::RING) {
+		persist_variables = false;
+		IniWarningW(L"Pool variables persistence is not supported for \"%ls\" index type (\"ring\" index only feature).\n - [%ls]\n",
+			lookup_enum_name(PoolIndexTypeNames, pool->index_type), pool->name.c_str());
+	}
+
+	pool->variable_template = std::make_unique<CommandListVariable> (
+		pool_id + L"_template",
+		GetIniFloat(section_name, L"pool_variable_default_value", 0, NULL),
+		persist_variables ? VariableFlags::PERSIST : VariableFlags::NONE
+	);
+
+	pool->Initialize(pool_size);
+
+	return pool;
+}
+
 static void ParseResourceSections()
 {
-	IniSections::iterator lower, upper, i;
-	wstring resource_id;
-	CustomResource *custom_resource;
-	wchar_t setting[MAX_PATH], path[MAX_PATH];
-	wstring namespace_path;
-	bool found;
-
+	// Edges point at entries of the maps cleared below:
+	ClearDeferredBindFlags();
+	customResourcePools.clear();
 	customResources.clear();
+
+	IniSections::iterator lower = ini_sections.lower_bound(wstring(L"Pool"));
+	IniSections::iterator upper = prefix_upper_bound(ini_sections, wstring(L"Pool"));
+
+	for (IniSections::iterator i = lower; i != upper; i++) {
+		wstring section_name = i->first;
+
+		LogInfoW(L"[%s]\n", section_name.c_str());
+
+		ParseResourcePoolSection(section_name.c_str());
+	}
 
 	lower = ini_sections.lower_bound(wstring(L"Resource"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"Resource"));
-	for (i = lower; i != upper; i++) {
-		LogInfoW(L"[%s]\n", i->first.c_str());
 
-		// Convert section name to lower case so our keys will be
-		// consistent in the unordered_map:
-		resource_id = i->first;
-		std::transform(resource_id.begin(), resource_id.end(), resource_id.begin(), ::towlower);
+	for (IniSections::iterator i = lower; i != upper; i++) {
+		wstring section_name = i->first;
 
-		// Empty Resource sections are valid (think of them as a
-		// sort of variable declaration), so explicitly construct a
-		// CustomResource for each one. Use the [] operator so the
-		// default constructor will be used:
-		custom_resource = &customResources[resource_id];
-		custom_resource->name = i->first;
+		LogInfoW(L"[%s]\n", section_name.c_str());
 
-		custom_resource->max_copies_per_frame =
-			GetIniInt(i->first.c_str(), L"max_copies_per_frame", 0, NULL);
-
-		if (GetIniStringAndLog(i->first.c_str(), L"filename", 0, setting, MAX_PATH)) {
-			// If this section was not in the main d3dx.ini, look
-			// for a file relative to the config it came from
-			// first, then try relative to the 3DMigoto directory:
-			get_namespaced_section_path(i->first.c_str(), &namespace_path);
-			found = false;
-			if (!namespace_path.empty()) {
-				GetModuleFileName(migoto_handle, path, MAX_PATH);
-				wcsrchr(path, L'\\')[1] = 0;
-				wcscat(path, namespace_path.c_str());
-				wcscat(path, setting);
-				if (GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES)
-					found = true;
-			}
-			if (!found) {
-				GetModuleFileName(migoto_handle, path, MAX_PATH);
-				wcsrchr(path, L'\\')[1] = 0;
-				wcscat(path, setting);
-			}
-			custom_resource->filename = path;
-		}
-
-		custom_resource->override_type = GetIniEnumClass(i->first.c_str(), L"type", CustomResourceType::INVALID, NULL, CustomResourceTypeNames);
-		custom_resource->override_mode = GetIniEnumClass(i->first.c_str(), L"mode", CustomResourceMode::DEFAULT, NULL, CustomResourceModeNames);
-
-		if (GetIniString(i->first.c_str(), L"format", 0, setting, MAX_PATH)) {
-			custom_resource->override_format = ParseFormatString(setting, true);
-			if (custom_resource->override_format == (DXGI_FORMAT)-1) {
-				IniWarning("WARNING: Unknown format \"%S\"\n", setting);
-			} else {
-				LogInfo("  format=%s\n", TexFormatStr(custom_resource->override_format));
-			}
-		}
-
-		custom_resource->override_width = GetIniInt(i->first.c_str(), L"width", -1, NULL);
-		custom_resource->override_height = GetIniInt(i->first.c_str(), L"height", -1, NULL);
-		custom_resource->override_depth = GetIniInt(i->first.c_str(), L"depth", -1, NULL);
-		custom_resource->override_mips = GetIniInt(i->first.c_str(), L"mips", -1, NULL);
-		custom_resource->override_array = GetIniInt(i->first.c_str(), L"array", -1, NULL);
-		custom_resource->override_msaa = GetIniInt(i->first.c_str(), L"msaa", -1, NULL);
-		custom_resource->override_msaa_quality = GetIniInt(i->first.c_str(), L"msaa_quality", -1, NULL);
-		custom_resource->override_byte_width = GetIniInt(i->first.c_str(), L"byte_width", -1, NULL);
-		custom_resource->override_stride = GetIniInt(i->first.c_str(), L"stride", -1, NULL);
-
-		custom_resource->width_multiply = GetIniFloat(i->first.c_str(), L"width_multiply", 1.0f, NULL);
-		custom_resource->height_multiply = GetIniFloat(i->first.c_str(), L"height_multiply", 1.0f, NULL);
-
-		if (GetIniStringAndLog(i->first.c_str(), L"bind_flags", 0, setting, MAX_PATH)) {
-			custom_resource->override_bind_flags = parse_enum_option_string<const wchar_t *, CustomResourceBindFlags, wchar_t*>
-				(CustomResourceBindFlagNames, setting, NULL);
-		}
-
-		if (GetIniStringAndLog(i->first.c_str(), L"misc_flags", 0, setting, MAX_PATH)) {
-			custom_resource->override_misc_flags = parse_enum_option_string<const wchar_t *, ResourceMiscFlags, wchar_t*>
-				(ResourceMiscFlagNames, setting, NULL);
-		}
-
-		ParseResourceInitialData(custom_resource, i->first.c_str());
+		ParseResourceSection(section_name.c_str(), nullptr);
 	}
 }
 
@@ -1842,20 +2214,20 @@ static bool ParseCommandListLine(const wchar_t *ini_section,
 		CommandList *post_command_list,
 		const wstring *ini_namespace)
 {
+	if (ParseCommandListVariableAssignment(ini_section, lhs, rhs, raw_line, command_list, pre_command_list, post_command_list, ini_namespace))
+		return true;
+
+	if (raw_line && !explicit_command_list &&
+		ParseCommandListFlowControl(ini_section, raw_line, pre_command_list, post_command_list, ini_namespace))
+		return true;
+
 	if (ParseCommandListGeneralCommands(ini_section, lhs, rhs, explicit_command_list, pre_command_list, post_command_list, ini_namespace))
 		return true;
 
 	if (ParseCommandListIniParamOverride(ini_section, lhs, rhs, command_list, ini_namespace))
 		return true;
 
-	if (ParseCommandListVariableAssignment(ini_section, lhs, rhs, raw_line, command_list, pre_command_list, post_command_list, ini_namespace))
-		return true;
-
-	if (ParseCommandListResourceCopyDirective(ini_section, lhs, rhs, command_list, ini_namespace))
-		return true;
-
-	if (raw_line && !explicit_command_list &&
-			ParseCommandListFlowControl(ini_section, raw_line, pre_command_list, post_command_list, ini_namespace))
+	if (ParseCommandListResourceCopyTargetDirective(ini_section, lhs, rhs, command_list, ini_namespace))
 		return true;
 
 	return false;
@@ -1936,7 +2308,7 @@ static void ParseCommandList(const wchar_t *id,
 				// whitelisted entries*, so check for
 				// duplicates here:
 				if (whitelisted_keys.count(key->c_str())) {
-					IniWarningW(L"WARNING: Duplicate non-command list key found in " INI_FILENAME L": [%ls] %ls\n", id, key->c_str());
+					IniWarningW(L"Duplicate non-command list key found: %ls\n - [%ls]\n", key->c_str(), id);
 				}
 				whitelisted_keys.insert(key->c_str());
 
@@ -1959,81 +2331,56 @@ static void ParseCommandList(const wchar_t *id,
 		}
 
 		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
-			LogInfo("  %S\n", raw_line->c_str());
+			LogInfoW(L"  %ls\n", raw_line->c_str());
 			continue;
 		}
 
-		if (entry->ini_namespace == G->user_config && !G->user_config.empty()) {
-			// Invalid command, but it is in the user config, which may happen
-			// if the user recently uninstalled/upgraded/etc a mod. We will flag
-			// the user config to be updated at the next save, but won't do this
-			// immediately just in case. Inform the user of what is happening.
-			if (!G->user_config_dirty) {
-				LogOverlay(LOG_WARNING,
-					"NOTICE: Unknown user settings will be removed from d3dx_user.ini\n"
-					" This is normal if you recently removed/changed any mods\n"
-					" Press %S to update the config now, or %S to reset all settings to default\n"
-					" The first unrecognised entry was: \"%S\"\n",
-					user_friendly_ini_key_binding(L"Hunting", L"reload_config").c_str(),
-					user_friendly_ini_key_binding(L"Hunting", L"wipe_user_config").c_str(),
-					raw_line->c_str());
-				// Once the [Constants] command list has finished running the
-				// low bit will be cleared to ensure that loading the user config
-				// itself cannot mark the user config as dirty. Set the second
-				// bit to indicate that it should be updated regardless:
-				G->user_config_dirty |= 2;
-			}
-			// There might be a lot of entries if a large mod was just
-			// uninstalled, so we only show the first bad setting on the
-			// overlay and log all other invalid settings to the log file:
-			LogInfo("WARNING: Unrecognised entry in %S: %S\n", G->user_config.c_str(), raw_line->c_str());
+		// Unknown d3dx_user.ini entries warning is handled by ShowUnknownSettingsNotification.
+		if (entry->ini_namespace == G->user_config && !G->user_config.empty())
 			continue;
-		}
 
-		IniWarning("WARNING: Unrecognised entry: %S\n", raw_line->c_str());
+		IniWarningW(L"Unrecognised entry: %ls\n - [%ls] @ [%ls]\n", raw_line->c_str(), id, entry->ini_namespace.c_str());
 	}
 
 	// Don't need the scope objects once parsing is complete. If all
 	// if/endifs were balanced correctly we should be back to the initial
 	// scope, so warn if we aren't:
-	if (std::distance(begin(scope), end(scope)) != 1)
-		IniWarning("WARNING: [%S] scope unbalanced\n", id);
+
+
+	if (std::distance(begin(scope), end(scope)) != 1) {
+		IniWarningW(L"Scope unbalanced\n - [%ls]\n", id);
+	}
 
 	pre_command_list->scope = NULL;
 	if (post_command_list)
 		post_command_list->scope = NULL;
 }
 
-static void ParseDriverProfile()
+CommandListVariable* RegisterGlobalVariable(wstring& name, float* fval, VariableFlags flags)
 {
-	IniSectionVector *section = NULL;
-	IniSectionVector::iterator entry;
-	wstring *lhs, *rhs;
-
-	// Arguably we should only parse this section the first time since the
-	// settings will only be applied on startup.
-	profile_settings.clear();
-
-	GetIniSection(&section, L"Profile");
-	for (entry = section->begin(); entry < section->end(); entry++) {
-		lhs = &entry->first;
-		rhs = &entry->second;
-
-		parse_ini_profile_line(lhs, rhs);
+	std::pair<CommandListVariables::iterator, bool> inserted = command_list_globals.emplace(name, CommandListVariable{ name, *fval, flags });
+	if (!inserted.second) {
+		return nullptr;
 	}
+
+	if (flags & VariableFlags::PERSIST)
+		persistent_variables.emplace_back(&inserted.first->second);
+
+	if (!fval)
+		LogInfo("  global %S\n", name.c_str());
+	else
+		LogInfo("  global %S=%f\n", name.c_str(), *fval);
+
+	return &inserted.first->second;
 }
 
 static void ParseConstantsSection()
 {
 	VariableFlags flags;
-	IniSectionVector *section = NULL;
-	IniSectionVector::iterator entry, next;
-	wstring *key, *val, name;
-	const wchar_t *name_pos;
-	const wstring *ini_namespace;
-	std::pair<CommandListVariables::iterator, bool> inserted;
-	float fval;
-	int len;
+	IniSectionVector* section = NULL;
+	wstring* key, * val, name;
+	const wchar_t* name_pos;
+	const wstring* ini_namespace;
 
 	// The naming on this one is historical - [Constants] used to define
 	// iniParams that couldn't change, then later we allowed them to be
@@ -2056,76 +2403,84 @@ static void ParseConstantsSection()
 	command_list_globals.clear();
 	persistent_variables.clear();
 	GetIniSection(&section, L"Constants");
-	for (next = section->begin(), entry = next; entry < section->end(); entry = next) {
-		next++;
-		key = &entry->first;
-		val = &entry->second;
-		ini_namespace = &entry->ini_namespace;
 
-		// The variable name will either be in the key if this line
+	// Process Globals while Compacting the Vector in-place.
+	//
+	// Previously each Global was Removed with vector::erase(), which
+	// Shifted every Following IniLine and therefore repeatedly Assigned
+	// it's Four WStrings. Instead, move each Non-Global Entry down once and
+	// Re:Size the Vector after the Pass.
+	size_t write_index = 0;
+
+	for (size_t read_index = 0; read_index < section->size(); ++read_index)
+	{
+		IniLine& entry = (*section)[read_index];
+
+		key = &entry.first;
+		val = &entry.second;
+		ini_namespace = &entry.ini_namespace;
+
+		// The Variable Name will either be in the Key if this Line
 		// also includes an assignment, or in raw_line if it does not:
 		if (!key->empty())
 			name = *key;
 		else
-			name = entry->raw_line;
+			name = entry.raw_line;
 
-		// Convert variable name to lower case since ini files are
-		// supposed to be case insensitive:
-		std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+		// Convert Variable Name to Lower Case since Ini Files are
+		// supposed to be Case Insensitive:
+		for (wchar_t& c : name)
+			c = ascii_tolower(c);
 
-		// Globals do not support pre/post since they are declarations
-		// with static initialisers where pre/post doesn't make sense
-		// (and [Constants] doesn't support them as yet either)
+		// Globals do not Support Pre/Post since they are Declarations
+		// with Static Initialisers where Pre/Post doesn't make sense
+		// (and [Constants] doesn't Support them as yet either)
 
-		flags = parse_enum_option_string_prefix<const wchar_t *, VariableFlags>
+		flags = parse_enum_option_string_prefix<const wchar_t*, VariableFlags>
 			(VariableFlagNames, name.c_str(), &name_pos);
+
 		if (!(flags & VariableFlags::GLOBAL))
+		{
+			// Keep Non-Global Entries in their Original Order.
+			// Move instead of Copy so the WStrings are Transferred
+			// without Allocating/Copying their Contents.
+			if (write_index != read_index)
+				(*section)[write_index] = std::move(entry);
+
+			++write_index;
 			continue;
+		}
+
 		name = name_pos;
 
 		if (!valid_variable_name(name)) {
-			IniWarning("WARNING: Illegal global variable name: \"%S\"\n", name.c_str());
+			IniWarningW(L"Illegal Global Variable Name: \"%ls\"\n - [Constants] @ [%ls]\n", name.c_str(), ini_namespace->c_str());
 			continue;
 		}
 
 		if (!ini_namespace->empty())
 			name = get_namespaced_var_name_lower(name, ini_namespace);
 
-		// Initialisation is optional and deferred until the command
-		// list is run
-		// If the initialiser is present and simple
-		fval = 0.0f;
-		if (!val->empty()) {
-			swscanf_s(val->c_str(), L"%f%n", &fval, &len);
-			if (len != val->length()) {
-				IniWarning("WARNING: Floating point parse error: %S=%S\n", key->c_str(), val->c_str());
+		// Initialisation is Optional and Deferred until the Command List is Run.
+		// If the Initialiser is Present and Simple.
+		float fval = 0.0f;
+		if (!val->empty())
+		{
+			if (!ParseFloatValue(L"Constants", key->c_str(), *val, fval, true, ini_namespace))
 				continue;
-			}
 		}
 
-		inserted = command_list_globals.emplace(name, CommandListVariable{name, fval, flags});
-		if (!inserted.second) {
-			IniWarning("WARNING: Redeclaration of %S\n", name.c_str());
+		if (!RegisterGlobalVariable(name, &fval, flags)) {
+			IniWarningW(L"Redeclaration of %ls\n - [Constants] @ [%ls]\n", name.c_str(), ini_namespace->c_str());
 			continue;
 		}
 
-		if (flags & VariableFlags::PERSIST)
-			persistent_variables.emplace_back(&inserted.first->second);
-
-		if (val->empty())
-			LogInfo("  global %S\n", name.c_str());
-		else
-			LogInfo("  global %S=%f\n", name.c_str(), fval);
-
-		// Remove this line from the ini section data structures so the
-		// command list won't consider it in the 2nd pass:
-		next = section->erase(entry);
+		// Global Entries are Intentionally not Copied into the Compacted
+		// Vector, so they will not be Processed during the Second Pass.
 	}
 
-	// Second pass for the command list:
-	G->constants_command_list.clear();
-	G->post_constants_command_list.clear();
-	ParseCommandList(L"Constants", &G->constants_command_list, &G->post_constants_command_list, NULL);
+	// Remove the Trailing Entries left behind by the Compacting Pass.
+	section->erase(section->begin() + write_index, section->end());
 }
 
 static wchar_t *true_false_overrule[] = {
@@ -2172,9 +2527,9 @@ static void check_shaderoverride_duplicates(bool duplicate, const wchar_t *id, S
 	}
 
 	if (duplicate && !allow_duplicates) {
-		IniWarning("WARNING: Possible Mod Conflict: Duplicate ShaderOverride hash=%16llx\n"
-			   "[%S]\n"
-			   "[%S]\n"
+		IniWarningW(L"Possible Mod Conflict: Duplicate ShaderOverride hash=%16llx\n"
+			   "[%ls]\n"
+			   "[%ls]\n"
 			   "If this is intentional, add allow_duplicate_hash=true or allow_duplicate_hash=overrule to suppress warning\n",
 			   hash, override->first_ini_section.c_str(), id);
 	}
@@ -2184,28 +2539,6 @@ static void check_shaderoverride_duplicates(bool duplicate, const wchar_t *id, S
 
 static void warn_deprecated_shaderoverride_options(const wchar_t *id, ShaderOverride *override)
 {
-	// I've seen several shaderhackers attempt to use the deprecated
-	// partner= in a way that won't work recently. Detect, warn and
-	// suggest an alternative. TODO: Add a way to check ps/vs/etc hashes
-	// directly to simplify this.
-	// TODO: Once we have a good simple alternative to the actual use case
-	// of partner=, issue a non-conditional deprecation warning. This might
-	// be something like if ps == ... ; handling=original ; endif
-	if (override->partner_hash && (!override->command_list.commands.empty() || !override->post_command_list.commands.empty())) {
-	        LogOverlay(LOG_NOTICE, "WARNING: [%S] tried to combine the deprecated partner= option with a command list.\n"
-	                               "This almost certainly won't do what you want. Try something like this instead:\n"
-	                               "\n"
-	                               "[%S_VERTEX_SHADER]\n"
-	                               "hash = <vertex shader hash>\n"
-	                               "filter_index = 5\n"
-	                               "\n"
-	                               "[%S_PIXEL_SHADER]\n"
-	                               "hash = <pixel shader hash>\n"
-	                               "x = vs\n"
-	                               "\n"
-	                               , id, id, id);
-	}
-
 	if (override->depth_filter != DepthBufferFilter::NONE) {
 	        LogOverlay(LOG_NOTICE, "NOTICE: [%S] used deprecated depth_filter option. Consider texture filtering for more flexibility:\n"
 	                               "\n"
@@ -2238,7 +2571,6 @@ wchar_t *ShaderOverrideIniKeys[] = {
 	L"hash",
 	L"allow_duplicate_hash",
 	L"depth_filter",
-	L"partner",
 	L"model",
 	L"disable_scissor",
 	L"filter_index",
@@ -2270,7 +2602,7 @@ static void ParseShaderOverrideSections()
 
 		hash = GetIniHash(id, L"Hash", 0, &found);
 		if (!found) {
-			IniWarning("WARNING: [%S] missing Hash=\n", id);
+			IniWarningW(L"Section missing Hash=\n - [%ls]\n", id);
 			continue;
 		}
 
@@ -2282,11 +2614,6 @@ static void ParseShaderOverrideSections()
 		check_shaderoverride_duplicates(duplicate, id, override, hash);
 
 		override->depth_filter = GetIniEnumClass(id, L"depth_filter", DepthBufferFilter::NONE, NULL, DepthBufferFilterNames);
-
-		// Simple partner shader filtering. Deprecated - more advanced
-		// filtering can be achieved by setting an ini param in the
-		// partner's [ShaderOverride] section, or the below filter_index
-		override->partner_hash = GetIniHash(id, L"partner", 0, NULL);
 
 		// Superior partner shader filtering that also supports a bound/unbound case
 		override->filter_index = GetIniFloat(id, L"filter_index", FLT_MAX, NULL);
@@ -2379,7 +2706,7 @@ static bool parse_shader_regex_section_main(const std::wstring *section_id, Shad
 	std::vector<std::string> items;
 
 	if (!GetIniStringAndLog(section_id->c_str(), L"shader_model", NULL, &setting)) {
-		IniWarning("WARNING: [%S] missing shader_model\n", section_id->c_str());
+		IniWarningW(L"RegEx section missing shader_model\n - [%ls]\n", section_id->c_str());
 		return false;
 	}
 	regex_group->shader_models = vec_to_set(split_string(&setting, ' '));
@@ -2429,7 +2756,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
 		return false;
 
 	if (regex_pattern->named_group_overlaps(regex_group->temp_regs)) {
-		IniWarning("WARNING: Named capture group overlaps with temp regs!\n");
+		IniWarningW(L"Named capture group overlaps with temp regs!\n - [%ls]\n", section_id->c_str());
 		return false;
 	}
 
@@ -2474,7 +2801,7 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
 	try {
 		regex_pattern = &regex_group->patterns.at(*pattern_id);
 	} catch (std::out_of_range) {
-		IniWarning("WARNING: Missing corresponding pattern section for %S\n", section_id->c_str());
+		IniWarningW(L"Missing corresponding pattern section\n - [%ls]\n", section_id->c_str());
 		return false;
 	}
 
@@ -2509,7 +2836,7 @@ static ShaderRegexGroup* get_regex_group(std::wstring *regex_id, bool allow_crea
 	try {
 		return &shader_regex_groups.at(*regex_id);
 	} catch (std::out_of_range) {
-		IniWarning("WARNING: Missing [%S] section\n", regex_id->c_str());
+		IniWarningW(L"Missing section\n - [%ls]\n", regex_id->c_str());
 		return NULL;
 	}
 }
@@ -2517,7 +2844,7 @@ static ShaderRegexGroup* get_regex_group(std::wstring *regex_id, bool allow_crea
 // Bo3b: 
 //   If we have a bad parse, we could wind up with a dangling half-baked
 //	 command list that would crash. Now also clearing them on error exit.
-static void delete_regex_group(std::wstring *regex_id)
+static void delete_regex_group(std::wstring* regex_id)
 {
 	ShaderRegexGroups::iterator i;
 
@@ -2614,7 +2941,7 @@ static void ParseShaderRegexSections()
 		// We delete the whole regex data structure if any of the subsections
 		// are not present, or fail to parse or compile so that we don't end up
 		// applying an incomplete regex to any shaders.
-		IniWarning("WARNING: disabling entire shader regex group [%S]\n", subsection_names[0].c_str());
+		IniWarningW(L"Disabling entire shader regex group\n - [%ls]\n", subsection_names[0].c_str());
 		delete_regex_group(&subsection_names[0]);
 	}
 
@@ -2667,12 +2994,14 @@ static void ParseShaderRegexSections()
 // function. Used by ParseCommandList to find any unrecognised lines.
 wchar_t *TextureOverrideIniKeys[] = {
 	L"hash",
-	L"stereomode",
 	L"format",
 	L"width",
 	L"height",
 	L"width_multiply",
 	L"height_multiply",
+	L"override_byte_stride",
+	L"override_vertex_count",
+	L"uav_byte_stride",
 	L"iteration",
 	L"filter_index",
 	L"expand_region_copy",
@@ -2690,9 +3019,9 @@ wchar_t *TextureOverrideFuzzyMatchesIniKeys[] = {
 
 static void parse_fuzzy_numeric_match_expression_error(const wchar_t *text)
 {
-	IniWarning("WARNING: Unable to parse expression - must be in the simple form:\n"
+	IniWarningW(L"Unable to parse expression - must be in the simple form:\n"
 	           "    [ operator ] value | field_name [ * field_name ] [ * multiplier ] [ / divider ]\n"
-	           "    Parse error on text: \"%S\"\n", text);
+	           "    Parse error on text: \"%ls\"\n", text);
 }
 
 static bool parse_fuzzy_field_name(const wchar_t **ptr, FuzzyMatchOperandType *field_type)
@@ -2814,7 +3143,7 @@ static void parse_fuzzy_numeric_match_expression(const wchar_t *setting, FuzzyMa
 			return parse_fuzzy_numeric_match_expression_error(ptr);
 		if (matcher->denominator == 0) {
 			matcher->denominator = 1;
-			IniWarning("WARNING: Denominator is zero: %S\n", ptr);
+			IniWarningW(L"Denominator is zero: %ls\n", ptr);
 			return;
 		}
 		ptr += len;
@@ -2836,13 +3165,44 @@ static void parse_texture_override_common(const wchar_t *id, TextureOverride *ov
 	if (found)
 		override->has_match_priority = true;
 
-	override->stereoMode = GetIniInt(id, L"StereoMode", -1, NULL);
 	override->format = GetIniInt(id, L"Format", -1, NULL);
 	override->width = GetIniInt(id, L"Width", -1, NULL);
 	override->height = GetIniInt(id, L"Height", -1, NULL);
 	override->width_multiply = GetIniFloat(id, L"width_multiply", 1.0f, NULL);
 	override->height_multiply = GetIniFloat(id, L"height_multiply", 1.0f, NULL);
 
+	if (G->allow_buffer_resize) 
+	{
+		// Handle buffer resize aka vertex limit raise feature.
+		int override_vertex_count = GetIniInt(id, L"override_vertex_count", -1.0f, &found);
+		if (override_vertex_count > 0) {
+			// Ensure that stride is specified.
+			int override_byte_stride = GetIniInt(id, L"override_byte_stride", -1, NULL);
+			if (override_byte_stride <= 0) {
+				LogOverlayW(LOG_DIRE, L"Failed to detect stride for override_vertex_count=%d, please set override_byte_stride!\n - [%ls]\n", override_vertex_count, override->ini_section.c_str());
+				return;
+			}
+			// Override buffer size according to section params.
+			override->override_byte_width = override_byte_stride * override_vertex_count;
+
+			// Handle UAV resize
+			int uav_byte_stride = GetIniInt(id, L"uav_byte_stride", -1.0f, &found);
+			if (uav_byte_stride > 0) {
+				// Use StructureByteStride override (useful when actual buffer stride is different from the one declared by a game)
+				override->override_num_elements = override_vertex_count * override_byte_stride / uav_byte_stride;
+			} else {
+				// Use VertexCount override
+				override->override_num_elements = override_vertex_count;
+			}
+		} else if (wcsstr(override->ini_section.c_str(), L"VertexLimitRaise") != 0) {
+			// Fall back to ~8MB buffer to mimic original GIMI behaviour if `VertexLimitRaise` keyword is found in the section header.
+			override->override_byte_width = 8800000;
+		} else {
+			// Do not override original buffer size.
+			override->override_byte_width = -1;
+		}
+	}
+	
 	if (GetIniString(id, L"Iteration", 0, setting, MAX_PATH))
 	{
 		// TODO: This supports more iterations than the
@@ -2960,12 +3320,12 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
 			(enum_names, token.c_str(), (T)0);
 
 		if (!tmp) {
-			IniWarning("WARNING: Invalid flag %S\n", token.c_str());
+			IniWarningW(L"Invalid flag %ls\n", token.c_str());
 			return false;
 		}
 
 		if ((*mask & tmp) == tmp) {
-			IniWarning("WARNING: Duplicate flag %S\n", token.c_str());
+			IniWarningW(L"Duplicate flag %ls\n", token.c_str());
 			return false;
 		}
 
@@ -3032,7 +3392,7 @@ static void parse_texture_override_fuzzy_match(const wchar_t *section)
 	if (GetIniStringAndLog(section, L"match_format", 0, setting, MAX_PATH)) {
 		fuzzy->Format.val = ParseFormatString(setting, true);
 		if (fuzzy->Format.val == (DXGI_FORMAT)-1)
-			IniWarning("WARNING: Unknown format \"%S\"\n", setting);
+			IniWarningW(L"Unknown format \"%ls\"\n", setting);
 		else
 			fuzzy->Format.op = FuzzyMatchOp::EQUAL;
 	}
@@ -3058,7 +3418,7 @@ static void parse_texture_override_fuzzy_match(const wchar_t *section)
 		parse_fuzzy_numeric_match_expression(setting, &fuzzy->SampleDesc_Quality);
 
 	if (!fuzzy->update_types_matched()) {
-		IniWarning("WARNING: [%S] can never match any resources\n", section);
+		IniWarningW(L"Section can never match any resources\n - [%ls]\n", section);
 		delete fuzzy;
 		return;
 	}
@@ -3094,11 +3454,50 @@ static void warn_if_duplicate_texture_hash(TextureOverride *override, uint32_t h
 		if (j->has_draw_context_match || j->has_match_priority)
 			continue;
 
-		IniWarning("WARNING: Possible Mod Conflict: Duplicate TextureOverride hash=%08lx\n"
-			   "[%S]\n"
-			   "[%S]\n"
+		IniWarningW(L"Possible Mod Conflict: Duplicate TextureOverride hash=%08lx\n"
+			   "[%ls]\n"
+			   "[%ls]\n"
 			   "If this is intentional, add a match_priority=n to suppress warning and disambiguate order\n",
 			   hash, j->ini_section.c_str(), override->ini_section.c_str());
+	}
+}
+
+static void index_byte_width_override(TextureOverride* override, uint32_t hash, map<uint32_t, int>& max_byte_width_map)
+{
+	map<uint32_t, int>::iterator max_byte_width;
+
+	max_byte_width = max_byte_width_map.find(hash);
+	if (max_byte_width == max_byte_width_map.end() || max_byte_width->second < override->override_byte_width) {
+		max_byte_width_map[hash] = override->override_byte_width;
+	}
+}
+
+static void update_byte_width_overrides(map<uint32_t, int>& max_byte_width_map)
+{
+	map<uint32_t, int>::iterator max_byte_width;
+
+	TextureOverrideMap::iterator i;
+	TextureOverrideList::iterator j;
+	TextureOverride* t;
+
+	for (max_byte_width = max_byte_width_map.begin(); max_byte_width != max_byte_width_map.end(); max_byte_width++) {
+		//IniWarningW(L"Evaluated target size for %08lx buffer: %d", max_byte_width->first, max_byte_width->second);
+
+		i = lookup_textureoverride(max_byte_width->first);
+
+		if (i == G->mTextureOverrideMap.end())
+			return;
+
+		for (j = i->second.begin(); j != i->second.end(); j++) {
+			t = &(*j);
+			if (t->override_byte_width < max_byte_width->second) {
+				//IniWarningW(L"Updated target size for %08lx buffer: %d -> %d\n - [%ls]\n", max_byte_width->first, t->override_byte_width, max_byte_width->second, t->ini_section.c_str());
+				t->override_byte_width = max_byte_width->second;
+			}
+			//else {
+			//	IniWarningW(L"Skipped target size update for %08lx buffer (%d -> %d)!\n - [%ls]\n", max_byte_width->first, t->override_byte_width, max_byte_width->second, t->ini_section.c_str());
+			//}
+		}
 	}
 }
 
@@ -3109,6 +3508,7 @@ static void ParseTextureOverrideSections()
 	TextureOverride *override;
 	uint32_t hash;
 	bool found;
+	map<uint32_t, int> max_byte_width_map;
 
 	// Lock entire routine, this can be re-inited.  These shaderoverrides
 	// are unlikely to be changing much, but for consistency.
@@ -3117,6 +3517,7 @@ static void ParseTextureOverrideSections()
 
 	G->mTextureOverrideMap.clear();
 	G->mFuzzyTextureOverrides.clear();
+	InvalidateTextureOverrideCandidates();
 
 	lower = ini_sections.lower_bound(wstring(L"TextureOverride"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"TextureOverride"));
@@ -3133,12 +3534,12 @@ static void ParseTextureOverrideSections()
 				continue;
 			}
 
-			IniWarning("WARNING: [%S] missing Hash= or valid match options\n", id);
+			IniWarningW(L"Section missing Hash= or valid match options\n - [%ls]\n", id);
 			continue;
 		}
 
 		if (texture_override_section_has_fuzzy_match_keys(id))
-			IniWarning("WARNING: [%S] Cannot use hash= and match options together!\n", id);
+			IniWarningW(L"Cannot use hash= and match options together!\n - [%ls]\n", id);
 
 		G->mTextureOverrideMap[hash].emplace_back(); // C++ gotcha: invalidates pointers into the vector
 		override = &G->mTextureOverrideMap[hash].back();
@@ -3150,7 +3551,15 @@ static void ParseTextureOverrideSections()
 		// Warn if same hash is used two or more times in sections that
 		// do not have a draw context match or match_priority:
 		warn_if_duplicate_texture_hash(override, hash);
+
+		// Record the largest `override_byte_width` value for the hash.
+		if (override->override_byte_width != -1) {
+			index_byte_width_override(override, hash, max_byte_width_map);
+		}
 	}
+
+	// Apply the largest per-hash buffer size overridesto all relevant TextureOverride sections.
+	update_byte_width_overrides(max_byte_width_map);
 
 	for (auto &tolkv : G->mTextureOverrideMap) {
 		// Sort the TextureOverride sections sharing the same hash to
@@ -3179,7 +3588,6 @@ static void ParseTextureOverrideSections()
 			registered_command_lists.push_back(&to.post_command_list);
 		}
 	}
-
 	LeaveCriticalSection(&G->mCriticalSection);
 }
 
@@ -3227,26 +3635,26 @@ static void ParseBlendOp(wchar_t *key, wchar_t *val, D3D11_BLEND_OP *op, D3D11_B
 			src_buf, (unsigned)ARRAYSIZE(src_buf),
 			dst_buf, (unsigned)ARRAYSIZE(dst_buf));
 	if (i != 3) {
-		IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
+		IniWarningW(L"Unrecognised %ls=%ls\n", key, val);
 		return;
 	}
 
 	try {
 		*op = (D3D11_BLEND_OP)ParseEnum(op_buf, L"D3D11_BLEND_OP_", BlendOPs, ARRAYSIZE(BlendOPs), 1);
 	} catch (EnumParseError) {
-		IniWarning("WARNING: Unrecognised blend operation %S\n", op_buf);
+		IniWarningW(L"Unrecognised blend operation %ls\n", op_buf);
 	}
 
 	try {
 		*src = (D3D11_BLEND)ParseEnum(src_buf, L"D3D11_BLEND_", BlendFactors, ARRAYSIZE(BlendFactors), 1);
 	} catch (EnumParseError) {
-		IniWarning("WARNING: Unrecognised blend source factor %S\n", src_buf);
+		IniWarningW(L"Unrecognised blend source factor %ls\n", src_buf);
 	}
 
 	try {
 		*dst = (D3D11_BLEND)ParseEnum(dst_buf, L"D3D11_BLEND_", BlendFactors, ARRAYSIZE(BlendFactors), 1);
 	} catch (EnumParseError) {
-		IniWarning("WARNING: Unrecognised blend destination factor %S\n", dst_buf);
+		IniWarningW(L"Unrecognised blend destination factor %ls\n", dst_buf);
 	}
 }
 
@@ -3424,32 +3832,32 @@ static void ParseStencilOp(wchar_t *key, wchar_t *val, D3D11_DEPTH_STENCILOP_DES
 			depth_fail_buf, (unsigned)ARRAYSIZE(depth_fail_buf),
 			stencil_fail_buf, (unsigned)ARRAYSIZE(stencil_fail_buf));
 	if (i != 4) {
-		IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
+		IniWarningW(L"Unrecognised %ls=%ls\n", key, val);
 		return;
 	}
 
 	try {
 		desc->StencilFunc = (D3D11_COMPARISON_FUNC)ParseEnum(func_buf, L"D3D11_COMPARISON_", ComparisonFuncs, ARRAYSIZE(ComparisonFuncs), 1);
 	} catch (EnumParseError) {
-		IniWarning("WARNING: Unrecognised stencil function %S\n", func_buf);
+		IniWarningW(L"Unrecognised stencil function %ls\n", func_buf);
 	}
 
 	try {
 		desc->StencilPassOp = (D3D11_STENCIL_OP)ParseEnum(both_pass_buf, L"D3D11_STENCIL_OP_", StencilOps, ARRAYSIZE(StencilOps), 1);
 	} catch (EnumParseError) {
-		IniWarning("WARNING: Unrecognised stencil + depth pass operation %S\n", both_pass_buf);
+		IniWarningW(L"Unrecognised stencil + depth pass operation %ls\n", both_pass_buf);
 	}
 
 	try {
 		desc->StencilDepthFailOp = (D3D11_STENCIL_OP)ParseEnum(depth_fail_buf, L"D3D11_STENCIL_OP_", StencilOps, ARRAYSIZE(StencilOps), 1);
 	} catch (EnumParseError) {
-		IniWarning("WARNING: Unrecognised stencil pass / depth fail operation %S\n", depth_fail_buf);
+		IniWarningW(L"Unrecognised stencil pass / depth fail operation %ls\n", depth_fail_buf);
 	}
 
 	try {
 		desc->StencilFailOp = (D3D11_STENCIL_OP)ParseEnum(stencil_fail_buf, L"D3D11_STENCIL_OP_", StencilOps, ARRAYSIZE(StencilOps), 1);
 	} catch (EnumParseError) {
-		IniWarning("WARNING: Unrecognised stencil fail operation %S\n", stencil_fail_buf);
+		IniWarningW(L"Unrecognised stencil fail operation %ls\n", stencil_fail_buf);
 	}
 }
 
@@ -3708,7 +4116,7 @@ static void ParseTopology(CustomShader *shader, const wchar_t *section)
 
 	}
 
-	IniWarning("WARNING: Unrecognised primitive topology=%S\n", val);
+	IniWarningW(L"Unrecognised primitive topology=%ls\n - [%ls]\n", val, section);
 }
 
 static void ParseSamplerState(CustomShader *shader, const wchar_t *section)
@@ -3762,7 +4170,7 @@ static void ParseSamplerState(CustomShader *shader, const wchar_t *section)
 			return;
 		}
 
-		IniWarning("WARNING: Unknown sampler \"%S\"\n", setting);
+		IniWarningW(L"Unknown sampler \"%ls\"\n - [%ls]\n", setting, section);
 	}
 }
 
@@ -3948,52 +4356,6 @@ static void ParseExplicitCommandListSections()
 	}
 }
 
-// Check the Stereo availability. If stereo is disabled we otherwise will crash 
-// when trying to create stereo texture.  This should be more graceful now.
-
-NvAPI_Status CheckStereo()
-{
-	NvU8 isStereoEnabled;
-	NvAPI_Status status = NvAPI_Stereo_IsEnabled(&isStereoEnabled);
-	if (status != NVAPI_OK)
-	{
-		// GeForce Stereoscopic 3D driver is not installed on the system
-		NvAPI_ShortString nvDescription;
-		NvAPI_GetErrorMessage(status, nvDescription);
-		LogInfo("  stereo init failed: no stereo driver detected- %s\n", nvDescription);
-		return status;
-	}
-
-	// Stereo is available but not enabled, let's enable it if specified.
-	if (!isStereoEnabled)
-	{
-		LogInfo("  stereo available but disabled.\n");
-
-		if (!G->gForceStereo)
-			return NVAPI_STEREO_NOT_ENABLED;
-
-		status = NvAPI_Stereo_Enable();
-		if (status != NVAPI_OK)
-		{
-			NvAPI_ShortString nvDescription;
-			NvAPI_GetErrorMessage(status, nvDescription);
-			LogInfo("   force enabling stereo failed- %s\n", nvDescription);
-			return status;
-		}
-	}
-
-	if (G->gCreateStereoProfile)
-	{
-		LogInfo("  enabling registry profile.\n");
-
-		NvAPI_Stereo_CreateConfigurationProfileRegistryKey(NVAPI_STEREO_DEFAULT_REGISTRY_PROFILE);
-	}
-
-	return NVAPI_OK;
-}
-
-
-
 void FlagConfigReload(HackerDevice *device, void *private_data)
 {
 	// When we reload the configuration, we are going to clear the existing
@@ -4005,6 +4367,12 @@ void FlagConfigReload(HackerDevice *device, void *private_data)
 	// We defer wiping the user config (if requested) until the reload in
 	// case something marks the user config as dirty between now and then:
 	G->gWipeUserConfig = !!private_data;
+}
+
+void ToggleInput(HackerDevice *device, void *private_data)
+{
+	G->disable_input = !G->disable_input;
+	LogOverlayW(LOG_INFO, L"> %ls %ls key bindings\n", G->disable_input ? L"Disabled" : L"Enabled", lookup_enum_name(InputDisableScopeNames, G->input_disable_scope));
 }
 
 static void ToggleFullScreen(HackerDevice *device, void *private_data)
@@ -4054,12 +4422,38 @@ static void warn_of_conflicting_d3dx(wchar_t *dll_ini_path)
 			"Using this configuration: %S\n", dll_ini_path);
 }
 
+// Caches TextureOverrides with match_index_count and match_vertex_count along with hash for fast lookup.
+// Used in buffer region hashes tracking system.
+void BuildTextureOverrideDrawMaps()
+{
+	G->mTextureOverrideDrawIndexMap.clear();
+	G->mTextureOverrideDrawVertexMap.clear();
+
+	for (auto& pair : G->mTextureOverrideMap)
+	{
+		uint32_t hash = pair.first;
+		TextureOverrideList& list = pair.second;
+
+		for (TextureOverride& ov : list)
+		{
+			if (ov.match_index_count.op == FuzzyMatchOp::EQUAL && ov.match_index_count.rhs_type1 == FuzzyMatchOperandType::VALUE) {
+				G->mTextureOverrideDrawIndexMap[ov.match_index_count.val].emplace_back(TextureOverrideFuzzyMatch{ hash, const_cast<TextureOverride*>(&ov) });
+				continue;
+			}
+			if (ov.match_vertex_count.op == FuzzyMatchOp::EQUAL && ov.match_vertex_count.rhs_type1 == FuzzyMatchOperandType::VALUE) {
+				G->mTextureOverrideDrawVertexMap[ov.match_vertex_count.val].emplace_back(TextureOverrideFuzzyMatch{ hash, const_cast<TextureOverride*>(&ov) });
+				continue;
+			}
+		}
+	}
+}
+
 void LoadConfigFile()
 {
 	wchar_t iniFile[MAX_PATH], logFilename[MAX_PATH];
 	wchar_t setting[MAX_PATH];
 
-	G->gInitialized = true;
+	setlocale(LC_CTYPE, "en_US.UTF-8");
 
 	if (!GetModuleFileName(migoto_handle, iniFile, MAX_PATH))
 		DoubleBeepExit();
@@ -4073,30 +4467,76 @@ void LoadConfigFile()
 	// so that there is no question what settings we are using.
 
 	// [Logging]
-	// Not using the helper function for this one since logging isn't enabled yet
-	if (GetPrivateProfileInt(L"Logging", L"calls", 1, iniFile))
+
+	gLogVerbosity = LogVerbosity::INVALID;
+
+	// GetPrivateProfileString is used because we need to initialize LogFile before using GetIni* helpers.
+	static wchar_t log_level[MAX_PATH] = { 0 };
+	GetPrivateProfileString(L"Logging", L"log_level", L"", log_level, MAX_PATH, iniFile);
+	bool log_level_specified = log_level[0] != L'\0';
+
+	bool init_log_file = false;
+	if (log_level_specified)
+	{
+		// New: `log_level` takes precedence over legacy options.
+		gLogVerbosity = lookup_enum_val(LogVerbosityNames, static_cast<const wchar_t*>(log_level), LogVerbosity::INVALID);
+		if (gLogVerbosity != LogVerbosity::INVALID)
+		{
+			init_log_file = gLogVerbosity != LogVerbosity::DISABLED;
+		}
+	}
+
+	if (gLogVerbosity == LogVerbosity::INVALID)
+	{
+		// Handle legacy `calls` option.
+		bool log_calls = GetPrivateProfileInt(L"Logging", L"calls", 0, iniFile);
+		if (log_calls)
+		{
+			init_log_file = true;  // `calls` option historically toggles logging.
+			gLogVerbosity = LogVerbosity::INFO;
+		}
+
+		// Handle legacy `debug` option.
+		bool log_debug = GetPrivateProfileInt(L"Logging", L"debug", 0, iniFile);
+		if (log_debug && log_calls)  // `debug` option historically relies on `calls = 1` set.
+		{
+			gLogVerbosity = LogVerbosity::DEBUG;
+		}
+	}
+
+	if (init_log_file)
 	{
 		if (!LogFile)
 			LogFile = _wfsopen(logFilename, L"w", _SH_DENYNO);
-		LogInfo("\nD3D11 DLL starting init - v %s - %s\n", VER_FILE_VERSION_STR, LogTime().c_str());
+
+		if (!LogFile)
+			gLogVerbosity = LogVerbosity::DISABLED;
+	}
+
+	if (gLogVerbosity == LogVerbosity::INVALID)
+		gLogVerbosity = LogVerbosity::DISABLED;
+
+	if (gLogVerbosity != LogVerbosity::DISABLED)
+	{
+		LogWarning("\nD3D11 DLL starting init - v %s - %s\n", VER_FILE_VERSION_STR, LogTime().c_str());
 
 		wchar_t our_path[MAX_PATH], exe_path[MAX_PATH];
 		GetModuleFileName(migoto_handle, our_path, MAX_PATH);
 		GetModuleFileName(NULL, exe_path, MAX_PATH);
-		LogInfo("Game path: %S\n"
-			"3DMigoto path: %S\n\n",
-			exe_path, our_path);
+
+		LogWarning("Game path: %S\n", exe_path);
+		LogWarning("3DMigoto path: %S\n\n", our_path);
 
 		LogInfoW(L"----------- " INI_FILENAME L" settings -----------\n");
+
+		LogInfo("[Logging]\n");
+		LogInfoW(L"  log_level=%ls\n", lookup_enum_name(LogVerbosityNames, gLogVerbosity));
 	}
-	LogInfo("[Logging]\n");
-	LogInfo("  calls=1\n");
+
+	gLogDebug = gLogVerbosity == LogVerbosity::DEBUG;
 
 	ParseIniFile(iniFile);
 	InsertBuiltInIniSections();
-
-	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);
-	gLogDebug = GetIniBool(L"Logging", L"debug", false, NULL);
 
 	// Unbuffered logging to remove need for fflush calls, and r/w access to make it easy
 	// to open active files.
@@ -4135,8 +4575,28 @@ void LoadConfigFile()
 	if (GetIniBool(L"Logging", L"debug_locks", false, NULL))
 		enable_lock_dependency_checks();
 
+	G->gShowWarnings = GetIniBool(L"Logging", L"show_warnings", true, NULL);
+
 	// [Include]
-	ParseIncludedIniFiles();
+	LogInfo("[Include]\n");
+
+	// Allows to delay DLL initialization by given ms count
+	G->gDllInitializationDelay = GetIniInt(L"System", L"dll_initialization_delay", 0, NULL);
+
+	// If enabled, prevents loading of includes during initialization
+	G->gSkipEarlyIncludesLoad = GetIniBool(L"System", L"skip_early_includes_load", true, NULL);
+
+	// Allows to delay initial config reload (any negative number disables it)
+	G->gConfigInitializationDelay = GetIniInt(L"System", L"config_initialization_delay", 0, NULL);
+	if (G->gConfigInitializationDelay < 0) {
+		G->gConfigInitialized = true;
+	}
+
+	if (G->gConfigInitialized || !G->gSkipEarlyIncludesLoad) {
+		ParseIncludedIniFiles();
+		// User config is loaded very last to allow it to override all other ini files.
+		ParsePersistentSettings();
+	}
 
 	// [System]
 	LogInfo("[System]\n");
@@ -4157,6 +4617,35 @@ void LoadConfigFile()
 	// TODO: Enable this by default if wider testing goes well:
 	G->check_foreground_window = GetIniBool(L"System", L"check_foreground_window", false, NULL);
 
+	// Allows to change interval between persistent vars autosaving to d3dx_user.ini (any negative number to disable it)
+	G->gSettingsAutoSaveInterval = GetIniInt(L"System", L"settings_auto_save_interval", 60, NULL);
+	if (G->gSettingsAutoSaveInterval < 0) {
+		G->gSettingsAutoSaveInterval = 2147483647;
+	}
+
+	// Controls whether saved values of persistent variables should be cleared when source mods are no longer detected (disabled or removed).
+	G->clear_unknown_settings = GetIniBool(L"System", L"clear_unknown_settings", true, NULL);
+
+	// Allows to configure fallback screen resolution to be used as return for `window_width` and `window_height`
+	G->gFallbackScreenWidth = GetIniInt(L"System", L"screen_width", 1920, NULL);
+	if (G->gFallbackScreenWidth < 640 || G->gFallbackScreenWidth > 15360) {
+		G->gFallbackScreenWidth = 1920;
+	}
+	G->gFallbackScreenHeight = GetIniInt(L"System", L"screen_height", 1080, NULL);
+	if (G->gFallbackScreenHeight < 480 || G->gFallbackScreenHeight > 8640) {
+		G->gFallbackScreenHeight = 1080;
+	}
+
+	G->gForceDetectColorSpace = GetIniBool(L"System", L"force_detect_color_space", false, NULL);
+
+	// [Input]
+	LogInfo("[Input]\n");
+	RegisterIniKeyBinding(L"Input", L"toggle_input", ToggleInput, NULL, 0, NULL);
+	bool disable_input_initialized = G->input_disable_scope != InputDisableScope::INVALID;
+	G->input_disable_scope = GetIniEnumClass(L"Input", L"input_disable_mode", InputDisableScope::MODS, NULL, InputDisableScopeNames);
+	if (!disable_input_initialized)
+		G->disable_input = !GetIniBool(L"Input", L"input", true, NULL);
+
 	// [Device] (DXGI parameters)
 	LogInfo("[Device]\n");
 	G->SCREEN_WIDTH = GetIniInt(L"Device", L"width", -1, NULL);
@@ -4176,21 +4665,12 @@ void LoadConfigFile()
 	G->SCREEN_FULLSCREEN = GetIniInt(L"Device", L"full_screen", -1, NULL);
 	RegisterIniKeyBinding(L"Device", L"toggle_full_screen", ToggleFullScreen, NULL, 0, NULL);
 	RegisterIniKeyBinding(L"Device", L"force_full_screen_on_key", ForceFullScreen, NULL, 0, NULL);
-	G->gForceStereo = GetIniInt(L"Device", L"force_stereo", 0, NULL);
 	G->SCREEN_ALLOW_COMMANDS = GetIniBool(L"Device", L"allow_windowcommands", false, NULL);
 
 	G->mResolutionInfo.from = GetIniEnumClass(L"Device", L"get_resolution_from", GetResolutionFrom::INVALID, NULL, GetResolutionFromNames);
 
 	G->hide_cursor = GetIniBool(L"Device", L"hide_cursor", false, NULL);
 	G->cursor_upscaling_bypass = GetIniBool(L"Device", L"cursor_upscaling_bypass", true, NULL);
-
-	// [Stereo]
-	LogInfo("[Stereo]\n");
-	bool automaticMode = GetIniBool(L"Stereo", L"automatic_mode", false, NULL);				// in NVapi dll
-	G->gCreateStereoProfile = GetIniBool(L"Stereo", L"create_profile", false, NULL);
-	G->gSurfaceCreateMode = GetIniInt(L"Stereo", L"surface_createmode", -1, NULL);
-	G->gSurfaceSquareCreateMode = GetIniInt(L"Stereo", L"surface_square_createmode", -1, NULL);
-	G->gForceNoNvAPI = GetIniBool(L"Stereo", L"force_no_nvapi", false, NULL);
 
 	// [Rendering]
 	LogInfo("[Rendering]\n");
@@ -4230,6 +4710,9 @@ void LoadConfigFile()
 	G->CACHE_SHADERS = GetIniBool(L"Rendering", L"cache_shaders", false, NULL);
 	G->SCISSOR_DISABLE = GetIniBool(L"Rendering", L"rasterizer_disable_scissor", false, NULL);
 	G->track_texture_updates = GetIniBoolOrInt(L"Rendering", L"track_texture_updates", 0, NULL);
+	G->track_region_hashes = GetIniBool(L"Rendering", L"track_region_hashes", false, NULL);
+	G->track_implicit_index_buffers = GetIniBool(L"Rendering", L"track_implicit_index_buffers", false, NULL);
+	G->allow_buffer_resize = GetIniBool(L"Rendering", L"allow_buffer_resize", true, NULL);
 	G->assemble_signature_comments = GetIniBool(L"Rendering", L"assemble_signature_comments", false, NULL);
 	G->disassemble_undecipherable_custom_data = GetIniBool(L"Rendering", L"disassemble_undecipherable_custom_data", false, NULL);
 	G->patch_cb_offsets = GetIniBool(L"Rendering", L"patch_assembly_cb_offsets", false, NULL);
@@ -4241,19 +4724,12 @@ void LoadConfigFile()
 	G->EXPORT_BINARY = GetIniBool(L"Rendering", L"export_binary", false, NULL);
 	G->DumpUsage = GetIniBool(L"Rendering", L"dump_usage", false, NULL);
 
-	G->StereoParamsReg = GetIniInt(L"Rendering", L"stereo_params", 125, NULL);
 	G->IniParamsReg = GetIniInt(L"Rendering", L"ini_params", 120, NULL);
-	G->decompiler_settings.StereoParamsReg = G->StereoParamsReg;
 	G->decompiler_settings.IniParamsReg = G->IniParamsReg;
-	if (G->StereoParamsReg >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-		IniWarning("WARNING: stereo_params=%i out of range\n", G->StereoParamsReg);
-		G->StereoParamsReg = -1;
-	}
 	if (G->IniParamsReg >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-		IniWarning("WARNING: ini_params=%i out of range\n", G->IniParamsReg);
+		IniWarningW(L"Option ini_params=%i out of range\n - [%ls]\n", G->IniParamsReg, INI_FILENAME);
 		G->IniParamsReg = -1;
 	}
-
 
 	// Automatic section
 	G->decompiler_settings.fixSvPosition = GetIniBool(L"Rendering", L"fix_sv_position", false, NULL);
@@ -4344,6 +4820,9 @@ void LoadConfigFile()
 	if (GetIniStringAndLog(L"Rendering", L"fix_MatrixOperand1Multiplier", 0, setting, MAX_PATH))
 		G->decompiler_settings.MatrixPos_MUL1 = readStringParameter(setting);
 
+	if (GetIniString(L"System", L"additional_foreground_window", nullptr, setting, MAX_PATH))
+		G->additionalForegroundWindowTitle = setting;
+
 	// [Hunting]
 	ParseHuntingSection();
 
@@ -4370,13 +4849,18 @@ void LoadConfigFile()
 	// [Preset]s may refer to:
 	EnumeratePresetOverrideSections();
 
-	// Must be done before any command lists that may refer to them:
-	ParseResourceSections();
-
 	// This is the only command list we permit to allocate global variables,
 	// so we parse it before all other command lists, key bindings and
 	// presets that may use those variables.
 	ParseConstantsSection();
+
+	// Must be done before any command lists that may refer to them:
+	ParseResourceSections();
+
+	// Second pass for the Constants command list:
+	G->constants_command_list.clear();
+	G->post_constants_command_list.clear();
+	ParseCommandList(L"Constants", &G->constants_command_list, &G->post_constants_command_list, NULL);
 
 	// Must be done after [Constants] has allocated global variables:
 	RegisterPresetKeyBindings();
@@ -4390,6 +4874,10 @@ void LoadConfigFile()
 	ParseShaderOverrideSections();
 	ParseShaderRegexSections();
 	ParseTextureOverrideSections();
+
+	// Build match_index_cound and match_vertex_count based cache for TextureOverride's
+	if (G->track_region_hashes)
+		BuildTextureOverrideDrawMaps();
 
 	LogInfo("[Present]\n");
 	G->present_command_list.clear();
@@ -4416,79 +4904,100 @@ void LoadConfigFile()
 	G->post_clear_uav_float_command_list.clear();
 	ParseCommandList(L"ClearUnorderedAccessViewFloat", &G->clear_uav_float_command_list, &G->post_clear_uav_float_command_list, NULL);
 
-	LogInfo("[Profile]\n");
-	ParseDriverProfile();
+	// Every command list is parsed now, so bind flags can be resolved
+	// through chains of custom resource references:
+	PropagateDeferredBindFlags();
 
 	LogInfo("\n");
 
 	if (G->hide_cursor || G->SCREEN_UPSCALING)
 		InstallMouseHooks(G->hide_cursor);
 
+	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+
 	emit_ini_warning_tone();
 }
 
-// This variant is called by the profile manager helper with the path to the
-// game's executable passed in. It doesn't need to parse most of the config,
-// only the [Profile] section and some of the logging. It uses a separate log
-// file from the main DLL.
-void LoadProfileManagerConfig(const wchar_t *config_dir)
+static void ResetUnknownSettingsCache()
 {
-	wchar_t iniFile[MAX_PATH], logFilename[MAX_PATH];
-
-	G->gInitialized = true;
-
-	if (wcscpy_s(iniFile, MAX_PATH, config_dir))
-		DoubleBeepExit();
-	wcsrchr(iniFile, L'\\')[1] = 0;
-	wcscpy(logFilename, iniFile);
-	wcscat(iniFile, INI_FILENAME);
-	wcscat(logFilename, L"d3d11_profile_log.txt");
-
-	// [Logging]
-	// Not using the helper function for this one since logging isn't enabled yet
-	if (GetPrivateProfileInt(L"Logging", L"calls", 1, iniFile))
-	{
-		if (!LogFile)
-			LogFile = _wfsopen(logFilename, L"w", _SH_DENYNO);
-		LogInfo("\n3DMigoto profile helper starting init - v %s - %s\n\n", VER_FILE_VERSION_STR, LogTime().c_str());
-		LogInfoW(L"----------- " INI_FILENAME L" settings -----------\n");
-	}
-	LogInfo("[Logging]\n");
-	LogInfo("  calls=1\n");
-
-	ParseIniFile(iniFile);
-
-	gLogDebug = GetIniBool(L"Logging", L"debug", false, NULL);
-
-	// Unbuffered logging to remove need for fflush calls, and r/w access to make it easy
-	// to open active files.
-	if (LogFile && GetIniBool(L"Logging", L"unbuffered", false, NULL))
-	{
-		int unbuffered = setvbuf(LogFile, NULL, _IONBF, 0);
-		LogInfo("    unbuffered return: %d\n", unbuffered);
-	}
-
-	LogInfo("[Profile]\n");
-	ParseDriverProfile();
-
-	LogInfo("\n");
+	unknown_variables.clear();
+	G->last_unknown_settings_hash = G->current_unknown_settings_hash;
+	G->current_unknown_settings_hash = 0;
 }
 
-void SavePersistentSettings()
+void RegisterUnknownSetting(const wchar_t* name, const float value)
 {
-	FILE *f;
+	unknown_variables[name] = value;
+}
 
-	if (!G->user_config_dirty)
+uint32_t HashUnknownSettings()
+{
+	uint32_t hash = 0;
+
+	for (const auto& entry : unknown_variables)
+	{
+		hash = crc32c_hw(hash, entry.first.data(), entry.first.size() * sizeof(wchar_t));
+		hash = crc32c_hw(hash, &entry.second, sizeof(entry.second));
+	}
+
+	return hash;
+}
+
+// Report unknown persistent variables found during the most recent config load.
+static void ShowUnknownSettingsNotification()
+{
+	if (unknown_variables.empty())
 		return;
-	G->user_config_dirty = 0;
+
+	const auto it = unknown_variables.begin();
+
+	const wchar_t* cleanup_message = G->clear_unknown_settings
+		? L" Unknown settings clean-up will remove them from d3dx_user.ini on next config reload\n"
+		L" To disable unknown settings clean-up, set \"clear_unknown_settings = 0\" inside d3dx.ini and restart the game\n"
+		: L" Unknown settings clean-up is disabled, so they will stay in d3dx_user.ini\n"
+		L" To enable unknown settings clean-up, set \"clear_unknown_settings = 1\" inside d3dx.ini and restart the game\n";
+
+	LogOverlayW(LOG_WARNING,
+		L"NOTICE: Detected %d unknown user settings in d3dx_user.ini\n"
+		L" This is normal if you removed/changed any mods\n"
+		L"%ls"
+		L" Press %ls to reload the config now, or %ls to reset all settings to default\n"
+		L" The first unrecognised entry was: \"%ls = %f\"\n",
+		unknown_variables.size(),
+		cleanup_message,
+		user_friendly_ini_key_binding(L"Hunting", L"reload_config").c_str(),
+		user_friendly_ini_key_binding(L"Hunting", L"wipe_user_config").c_str(),
+		it->first.c_str(),
+		it->second);
+
+	for (auto& entry : unknown_variables)
+		LogWarningW(L"Unrecognised persistent variable: %ls = %f\n", entry.first.c_str(), entry.second);
+}
+
+// Save the currently known persistent variables to d3dx_user.ini.
+// Unknown variables are handled separately by HandleUnknownPersistentSettings():
+// they are discovered by LoadConfigFile() after this function runs and may be
+// appended back to the file separately.
+bool SavePersistentSettings(bool force)
+{
+	G->gSettingsSaveTime = G->gTime;
+
+	if (!G->user_config_dirty && !force)
+		return false;
+
+	setlocale(LC_CTYPE, "en_US.UTF-8");
 
 	// TODO: Ability to update existing file rather than overwriting:
 	//wfopen_ensuring_access(&f, G->user_config.c_str(), L"r+");
 	//if (!f)
+
+	FILE* f;
 	wfopen_ensuring_access(&f, G->user_config.c_str(), L"w");
-	if (!f) {
-		LogInfo("Unable to save settings in %S\n", G->user_config.c_str());
-		return;
+	if (!f)
+	{
+		LogWarning("Unable to save settings in %S\n", G->user_config.c_str());
+		setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+		return false;
 	}
 
 	LogInfo("Saving user settings to %S\n", G->user_config.c_str());
@@ -4503,17 +5012,112 @@ void SavePersistentSettings()
 	      "[Constants]\n", f);
 
 	for (auto global : persistent_variables)
-		fprintf_s(f, "%S = %.9g\n", global->name.c_str(), global->fval);
+		fprintf_s(f, "%ls = %.9g\n", global->name.c_str(), global->fval);
+
+	G->user_config_dirty = false;
 
 	fclose(f);
+
+	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+
+	return true;
 }
 
+// Append unknown persistent variables to the user config. This is safe because
+// SavePersistentSettings() rewrites the file before every config reload, so
+// anything appended here is temporary: it will disappear on the next reload
+// unless HandleUnknownPersistentSettings() appends it again.
+bool SaveUnknownPersistentSettings()
+{
+	if (unknown_variables.empty())
+		return false;
+
+	setlocale(LC_CTYPE, "en_US.UTF-8");
+
+	FILE* f;
+	wfopen_ensuring_access(&f, G->user_config.c_str(), L"a");
+	if (!f)
+	{
+		LogWarning("Unable to save unknown settings in %S\n", G->user_config.c_str());
+		setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+		return false;
+	}
+
+	LogInfo("Saving unknown user settings to %S\n", G->user_config.c_str());
+
+	for (auto& entry : unknown_variables)
+		fprintf_s(f, "%ls = %.9g\n", entry.first.c_str(), entry.second);
+
+	fclose(f);
+
+	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+
+	return true;
+}
+
+// Handle unknown persistent variables discovered by LoadConfigFile().
+//
+// If clear_unknown_settings is disabled, unknown variables are always appended
+// to d3dx_user.ini so they are permanently preserved across config reloads.
+//
+// If clear_unknown_settings is enabled, unknown variables are given one reload
+// grace period: they are appended to d3dx_user.ini when first encountered, so
+// they can become recognised after the next reload. If they are still unknown
+// on that next reload, they are considered stale and are removed instead.
+static void HandleUnknownPersistentSettings()
+{
+	if (unknown_variables.empty())
+		return;
+
+	if (!G->clear_unknown_settings)
+	{
+		// Cleanup is disabled: keep unknown settings permanently.
+
+		// Write d3dx_user.ini only if unknown settings changed since last config reload.
+		if (G->current_unknown_settings_hash != G->last_unknown_settings_hash)
+		{
+			// Write current persistent variables to d3dx_user.ini (purge all unknowns).
+			SavePersistentSettings(true);
+			// Write unknowns to d3dx_user.ini.
+			SaveUnknownPersistentSettings();
+		}
+		ShowUnknownSettingsNotification();
+		return;
+	}
+
+	// If the unknown settings have remained unchanged across a reload,
+	// consider them stale and remove them.
+	if (G->current_unknown_settings_hash == G->last_unknown_settings_hash)
+	{
+		LogOverlayW(LOG_WARNING, L"> Cleared %d unknown user settings from d3dx_user.ini\n", unknown_variables.size());
+		unknown_variables.clear();
+		// Write current persistent variables to d3dx_user.ini (purge all unknowns).
+		SavePersistentSettings(true);
+	}
+	else
+	{
+		// First time we've seen these unknown settings: do nothing.
+		// Before config reload we've already saved them to d3dx_user.ini.
+		// This way they get a chance to become recognised again.
+	}
+
+	ShowUnknownSettingsNotification();
+}
+
+// Delete the entire persistent user config, including any unknown variables
+// retained from previous config loads.
 static void WipeUserConfig()
 {
 	G->gWipeUserConfig = false;
-	G->user_config_dirty = 0;
+	G->user_config_dirty = false;
+
+	unknown_variables.clear();
+	G->current_unknown_settings_hash = 0;
+	G->last_unknown_settings_hash = 0;
 
 	DeleteFile(G->user_config.c_str());
+
+	LogOverlayW(LOG_INFO, L"> Wiped user config file d3dx_user.ini\n");
 }
 
 static void MarkAllShadersDeferredUnprocessed()
@@ -4537,52 +5141,70 @@ static void MarkAllShadersDeferredUnprocessed()
 
 void ReloadConfig(HackerDevice *device)
 {
+	auto start = std::chrono::high_resolution_clock::now();
+
 	HackerContext *mHackerContext = device->GetHackerContext();
 
-	if (G->gWipeUserConfig)
-		WipeUserConfig();
+	{
+		// Serialize config reload against other threads that may access the global
+		// configuration state. ReloadConfig() replaces/clears many global structures,
+		// so they must not be observed in a partially reloaded state.
+		CriticalSectionGuard(&G->mCriticalSection);
 
-	SavePersistentSettings();
+		// Clears any notices currently displayed on the overlay. This ensures
+		// that any notices that haven't timed out yet (e.g. from a previous
+		// failed reload attempt) are removed so that the only messages
+		// displayed will be relevant to the current reload attempt.
+		//
+		// The shader reload is separate and will also attempt to clear old
+		// notices - ClearNotices() itself will ensure that only the first one
+		// of these actually takes effect in the current frame.
+		ClearNotices();
 
-	LogInfoW(L"Reloading " INI_FILENAME L" (EXPERIMENTAL)...\n");
+		// Clear the key bindings. There may be other things that need to be
+		// cleared as well, but for the sake of clarity I'd rather clear as
+		// many as possible inside LoadConfigFile() where they are set.
+		ClearKeyBindings();
 
-	G->gReloadConfigPending = false;
-	G->iniParamsReserved = 0;
+		LogWarningW(
+			L"\n\n"
+			L"------------------------------------------------------------------------------------------------------\n"
+			L" Reloading " INI_FILENAME L"...\n"
+			L"------------------------------------------------------------------------------------------------------\n"
+		);
 
-	// Lock the entire config reload as it touches many global structures
-	// that could potentially be accessed from other threads (e.g. deferred
-	// contexts) while we do this
-	EnterCriticalSectionPretty(&G->mCriticalSection);
+		if (G->gWipeUserConfig)
+			WipeUserConfig();
 
-	// Clears any notices currently displayed on the overlay. This ensures
-	// that any notices that haven't timed out yet (e.g. from a previous
-	// failed reload attempt) are removed so that the only messages
-	// displayed will be relevant to the current reload attempt.
-	//
-	// The shader reload is separate and will also attempt to clear old
-	// notices - ClearNotices() itself will ensure that only the first one
-	// of these actually takes effect in the current frame.
-	ClearNotices();
+		G->gReloadConfigPending = false;
+		G->iniParamsReserved = 0;
 
-	// Clear the key bindings. There may be other things that need to be
-	// cleared as well, but for the sake of clarity I'd rather clear as
-	// many as possible inside LoadConfigFile() where they are set.
-	ClearKeyBindings();
+		// Clear active command lists set, as the pointers in this set will
+		// become invalid as the config is reloaded:
+		clear_command_list_profiling();
 
-	// Clear active command lists set, as the pointers in this set will
-	// become invalid as the config is reloaded:
-	command_lists_profiling.clear();
-	command_lists_cmd_profiling.clear();
+		// Reset the counters on the global parameter save area:
+		OverrideSave.Reset(device);
 
-	// Reset the counters on the global parameter save area:
-	OverrideSave.Reset(device);
+		// Save both currently known and unknown persistent variables to d3dx_user.ini.
+		// Result is loaded back by LoadConfigFile() as final step of includes parsing.
+		if (SavePersistentSettings())
+			SaveUnknownPersistentSettings();
 
-	LoadConfigFile();
-	optimise_command_lists(device);
+		// Reset unknown variables map, so LoadConfigFile() could detect them from scratch.
+		ResetUnknownSettingsCache();
 
-	MarkAllShadersDeferredUnprocessed();
+		// Parse d3dx.ini and all includes.
+		LoadConfigFile();
 
-	LeaveCriticalSection(&G->mCriticalSection);
+		G->current_unknown_settings_hash = HashUnknownSettings();
+
+		setlocale(LC_CTYPE, "en_US.UTF-8");
+
+		optimise_command_lists(device);
+
+		MarkAllShadersDeferredUnprocessed();
+	}
 
 	// Execute the [Constants] command list in the immediate context to
 	// initialise iniParams and perform any other custom initialisation the
@@ -4606,5 +5228,19 @@ void ReloadConfig(HackerDevice *device)
 		LogOverlay(LOG_DIRE, "BUG: No HackerContext at ReloadConfig - please report this\n");
 	}
 
-	LogOverlayW(LOG_INFO, L"> " INI_FILENAME L" reloaded\n");
+	// Handle unknown persistent variables discovered by LoadConfigFile().
+	// This is done after [Constants] initialization so that the current reload
+	// has fully established which variables are recognised before deciding
+	// whether unknown variables should be retained or removed.
+	{
+		CriticalSectionGuard(&G->mCriticalSection);
+		HandleUnknownPersistentSettings();
+	}
+
+	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+
+	auto stop = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<float> duration = stop - start;
+
+	LogOverlayW(LOG_INFO, L"> Reloaded config in %.3fs\n", duration.count());
 }

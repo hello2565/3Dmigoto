@@ -7,24 +7,11 @@
 #include "profiling.h"
 #include "overlay.h"
 
-// DirectXTK headers failed to include their own pre-requisites.
-// We just want GetSurfaceInfo from LoaderHelpers, so that is now
-// copied directly to the file here, as it is small and self-contained.
-
-namespace DirectX
-{
-	namespace LoaderHelpers
-	{
-		HRESULT GetSurfaceInfo(
-			_In_ size_t width,
-			_In_ size_t height,
-			_In_ DXGI_FORMAT fmt,
-			_Out_opt_ size_t* outNumBytes,
-			_Out_opt_ size_t* outRowBytes,
-			_Out_opt_ size_t* outNumRows) noexcept;
-	}
-}
-
+// DirectXTK headers fail to include their own pre-requisits. We just want
+// GetSurfaceInfo from LoaderHelpers
+#include "DirectXTK/Src/pch.h"
+#include "DirectXTK/Src/PlatformHelpers.h"
+#include "DirectXTK/Src/LoaderHelpers.h"
 
 // Overloaded functions to log any kind of resource description (useful to call
 // from templates):
@@ -952,7 +939,7 @@ static bool supports_hash_tracking(ResourceHandleInfo *handle_info)
 	// support for them later, we should add a means to turn off the
 	// contamination detection on a per-resource type basis:
 	return (handle_info->type == D3D11_RESOURCE_DIMENSION_TEXTURE2D ||
-	        handle_info->type == D3D11_RESOURCE_DIMENSION_TEXTURE3D);
+		handle_info->type == D3D11_RESOURCE_DIMENSION_TEXTURE3D);
 }
 
 static bool GetResourceInfoFields(struct ResourceHashInfo *info, UINT subresource,
@@ -994,13 +981,25 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 	UINT dstWidth = 1, dstHeight = 1, dstDepth = 1, dstMip = 0, dstIdx = 0, dstArraySize = 1;
 	bool partial = false;
 	ResourceInfoMap::iterator info_i;
+	D3D11_RESOURCE_DIMENSION dim;
 	Profiling::State profiling_state;
 
 	if (!dest)
 		return;
 
-	if (Profiling::mode == Profiling::Mode::SUMMARY)
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		Profiling::hash_tracking_overhead.count++;
 		Profiling::start(&profiling_state);
+	}
+
+	// Contamination is only tracked for 2D/3D textures (see
+	// supports_hash_tracking), but the bulk of the calls here are for
+	// buffers - constant buffers Mapped or UpdateSubresource'd on every
+	// draw. Ask the resource for its type up front so those bail before
+	// taking the locks and searching the resource map for nothing:
+	dest->GetType(&dim);
+	if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D && dim != D3D11_RESOURCE_DIMENSION_TEXTURE3D)
+		goto out_profile;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
@@ -1014,6 +1013,9 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 	dstHash = dst_handle_info->orig_hash;
 	if (!dstHash)
 		goto out_unlock;
+
+	if (Profiling::mode == Profiling::Mode::SUMMARY)
+		Profiling::hash_tracking_overhead.hits++;
 
 	// Faster than catching an out_of_range exception from .at():
 	info_i = G->mResourceInfo.find(dstHash);
@@ -1104,6 +1106,7 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 out_unlock:
 	LeaveCriticalSection(&G->mCriticalSection);
 
+out_profile:
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::end(&profiling_state, &Profiling::hash_tracking_overhead);
 }
@@ -1343,7 +1346,6 @@ ULONG STDMETHODCALLTYPE ResourceReleaseTracker::Release(void)
 		// lock held to protect it's notices data structure.      //
 		//                                                        //
 		////////////////////////////////////////////////////////////
-
 		EnterCriticalSectionPretty(&G->mResourcesLock);
 		G->mResources.erase(resource);
 		LeaveCriticalSection(&G->mResourcesLock);
@@ -1639,22 +1641,23 @@ static bool matches_draw_info(TextureOverride *tex_override, DrawCallInfo *call_
 	if (!call_info)
 		return false;
 
-	if (!tex_override->match_first_vertex.matches_uint(call_info->FirstVertex))
+	if (!tex_override->match_index_count.matches_uint(call_info->IndexCount))
 		return false;
 	if (!tex_override->match_first_index.matches_uint(call_info->FirstIndex))
 		return false;
-	if (!tex_override->match_first_instance.matches_uint(call_info->FirstInstance))
-		return false;
 	if (!tex_override->match_vertex_count.matches_uint(call_info->VertexCount))
 		return false;
-	if (!tex_override->match_index_count.matches_uint(call_info->IndexCount))
+	if (!tex_override->match_first_vertex.matches_uint(call_info->FirstVertex))
 		return false;
 	if (!tex_override->match_instance_count.matches_uint(call_info->InstanceCount))
 		return false;
+	if (!tex_override->match_first_instance.matches_uint(call_info->FirstInstance))
+		return false;
+
 	return true;
 }
 
-static void find_texture_override_for_hash(uint32_t hash, TextureOverrideMatches *matches, DrawCallInfo *call_info)
+void find_texture_override_for_hash(uint32_t hash, TextureOverrideMatches *matches, DrawCallInfo *call_info)
 {
 	TextureOverrideMap::iterator i;
 	TextureOverrideList::iterator j;
@@ -1669,33 +1672,222 @@ static void find_texture_override_for_hash(uint32_t hash, TextureOverrideMatches
 	}
 }
 
-static void find_texture_override_for_resource_by_hash(ID3D11Resource *resource, TextureOverrideMatches *matches, DrawCallInfo *call_info)
+static uint32_t get_hash_for_resource(ID3D11Resource* resource)
 {
-	uint32_t hash = 0;
-
 	if (!resource)
-		return;
-
-	if (G->mTextureOverrideMap.empty())
-		return;
+		return 0;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
-		hash = GetResourceHash(resource);
+	uint32_t hash = GetResourceHash(resource);
 	LeaveCriticalSection(&G->mCriticalSection);
+
+	return hash;
+}
+
+TextureOverrideFuzzyMatches* get_fuzzy_matches_by_draw_info(DrawCallInfo* call_info)
+{
+	if (call_info->IndexCount)
+	{
+		auto it = G->mTextureOverrideDrawIndexMap.find(call_info->IndexCount);
+		if (it != G->mTextureOverrideDrawIndexMap.end()) {
+			return &it->second;
+		}
+	}
+	else if (call_info->VertexCount)
+	{
+		auto it = G->mTextureOverrideDrawVertexMap.find(call_info->VertexCount);
+		if (it != G->mTextureOverrideDrawVertexMap.end()){
+			return &it->second;
+		}
+	}
+	return nullptr;
+}
+
+void find_texture_overrides_by_hash_from_fuzzy_matches(uint32_t hash, TextureOverrideFuzzyMatches* fuzzy_matches, TextureOverrideMatches* matches, DrawCallInfo* call_info)
+{
+	TextureOverrideFuzzyMatches::iterator it;
+
+	for (it = fuzzy_matches->begin(); it != fuzzy_matches->end(); ++it) {
+		if (it->hash == hash && matches_draw_info(it->texture_override, call_info)) {
+			matches->push_back(it->texture_override);
+		}
+	}
+}
+
+void find_texture_overrides_for_resource_by_hash_from_fuzzy_matches(ID3D11Resource* resource, TextureOverrideFuzzyMatches* fuzzy_matches, TextureOverrideMatches* matches, DrawCallInfo* call_info)
+{
+	uint32_t hash = get_hash_for_resource(resource);
 	if (!hash)
 		return;
 
-	find_texture_override_for_hash(hash, matches, call_info);
+	find_texture_overrides_by_hash_from_fuzzy_matches(hash, fuzzy_matches, matches, call_info);
+}
+
+// find_texture_overrides_for_desc without the draw context filter, for caching:
+template <typename DescType>
+static void collect_fuzzy_texture_overrides_for_desc(const DescType *desc, std::vector<TextureOverride*> *out)
+{
+	FuzzyTextureOverrides::iterator i;
+	Profiling::State profiling_state;
+
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		Profiling::texture_override_fuzzy_match_overhead.count++;
+		Profiling::start(&profiling_state);
+	}
+
+	for (i = G->mFuzzyTextureOverrides.begin(); i != G->mFuzzyTextureOverrides.end(); i++) {
+		if ((*i)->matches(desc))
+			out->push_back((*i)->texture_override);
+	}
+
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		Profiling::end(&profiling_state, &Profiling::texture_override_fuzzy_match_overhead);
+		if (!out->empty())
+			Profiling::texture_override_fuzzy_match_overhead.hits++;
+	}
+}
+
+static void collect_fuzzy_texture_overrides_for_resource(ID3D11Resource *resource, std::vector<TextureOverride*> *out)
+{
+	D3D11_RESOURCE_DIMENSION dimension;
+	resource->GetType(&dimension);
+	switch (dimension) {
+		case D3D11_RESOURCE_DIMENSION_BUFFER:
+		{
+			D3D11_BUFFER_DESC desc;
+			((ID3D11Buffer*)resource)->GetDesc(&desc);
+			return collect_fuzzy_texture_overrides_for_desc(&desc, out);
+		}
+		case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+		{
+			D3D11_TEXTURE1D_DESC desc;
+			((ID3D11Texture1D*)resource)->GetDesc(&desc);
+			return collect_fuzzy_texture_overrides_for_desc(&desc, out);
+		}
+		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+		{
+			D3D11_TEXTURE2D_DESC desc;
+			((ID3D11Texture2D*)resource)->GetDesc(&desc);
+			return collect_fuzzy_texture_overrides_for_desc(&desc, out);
+		}
+		case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+		{
+			D3D11_TEXTURE3D_DESC desc;
+			((ID3D11Texture3D*)resource)->GetDesc(&desc);
+			return collect_fuzzy_texture_overrides_for_desc(&desc, out);
+		}
+	}
+}
+
+void InvalidateTextureOverrideCandidates()
+{
+	EnterCriticalSectionPretty(&G->mResourcesLock);
+
+	for (auto &entry : G->mResources) {
+		entry.second.texture_override_candidates_valid = false;
+		entry.second.texture_override_candidates.hash_matches = NULL;
+		entry.second.texture_override_candidates.fuzzy_matches.clear();
+	}
+
+	LeaveCriticalSection(&G->mResourcesLock);
+}
+
+// Must be called with G->mCriticalSection held, and the returned candidates
+// read before releasing it: they are built and stored in ResourceHandleInfo
+// here, so concurrent draws on deferred contexts must not race on them.
+//
+// hash_matches is keyed on the whole-resource hash (handle_info->hash), so
+// it is only valid for lookups by that hash. Region hash lookups (a vertex
+// or index buffer shared by several meshes, see track_region_hashes) do
+// their own hash matching by region_hash and only use fuzzy_matches from
+// here, which depend on the resource description alone and are therefore
+// the same for every region of the buffer.
+TextureOverrideCandidates* get_texture_override_candidates(ID3D11Resource *resource)
+{
+	ResourceHandleInfo *handle_info = GetResourceHandleInfo(resource);
+	if (!handle_info)
+		return NULL;
+
+	TextureOverrideCandidates *candidates = &handle_info->texture_override_candidates;
+
+	if (!handle_info->texture_override_candidates_valid) {
+		if (!G->mFuzzyTextureOverrides.empty())
+			collect_fuzzy_texture_overrides_for_resource(resource, &candidates->fuzzy_matches);
+
+		handle_info->texture_override_candidates_valid = true;
+		handle_info->texture_override_hash = handle_info->hash + 1; // force rebuild below
+	}
+
+	if (handle_info->texture_override_hash != handle_info->hash) {
+		candidates->hash_matches = NULL;
+
+		if (handle_info->hash && !G->mTextureOverrideMap.empty()) {
+			TextureOverrideMap::iterator i = lookup_textureoverride(handle_info->hash);
+			if (i != G->mTextureOverrideMap.end())
+				candidates->hash_matches = &i->second;
+		}
+
+		handle_info->texture_override_hash = handle_info->hash;
+	}
+
+	return candidates;
+}
+
+// Fuzzy (match_*) matching only, from the per resource cache. Used by the
+// region hash path, which has already done its hash matching by region_hash
+// and must not use the cached whole-resource hash_matches.
+void find_fuzzy_texture_overrides_for_resource(ID3D11Resource *resource, TextureOverrideMatches *matches, DrawCallInfo *call_info)
+{
+	if (G->mFuzzyTextureOverrides.empty())
+		return;
+
+	Profiling::State profiling_state;
+	size_t matches_before = 0;
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		matches_before = matches->size();
+		Profiling::texture_override_candidates_lookup_overhead.count++;
+		Profiling::start(&profiling_state);
+	}
+
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	TextureOverrideCandidates *candidates = get_texture_override_candidates(resource);
+	if (candidates) {
+		for (TextureOverride *to : candidates->fuzzy_matches) {
+			if (matches_draw_info(to, call_info))
+				matches->push_back(to);
+		}
+	}
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		Profiling::end(&profiling_state, &Profiling::texture_override_candidates_lookup_overhead);
+		if (matches->size() > matches_before)
+			Profiling::texture_override_candidates_lookup_overhead.hits++;
+	}
 }
 
 template <typename DescType>
 static void find_texture_overrides_for_desc(const DescType *desc, TextureOverrideMatches *matches, DrawCallInfo *call_info)
 {
 	FuzzyTextureOverrides::iterator i;
+	Profiling::State profiling_state;
+	size_t matches_before = 0;
+
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		matches_before = matches->size();
+		Profiling::texture_override_fuzzy_match_overhead.count++;
+		Profiling::start(&profiling_state);
+	}
 
 	for (i = G->mFuzzyTextureOverrides.begin(); i != G->mFuzzyTextureOverrides.end(); i++) {
 		if ((*i)->matches(desc) && matches_draw_info((*i)->texture_override, call_info))
 			matches->push_back((*i)->texture_override);
+	}
+
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		Profiling::end(&profiling_state, &Profiling::texture_override_fuzzy_match_overhead);
+		if (matches->size() > matches_before)
+			Profiling::texture_override_fuzzy_match_overhead.hits++;
 	}
 }
 
@@ -1720,41 +1912,40 @@ template void find_texture_overrides<D3D11_TEXTURE3D_DESC>(uint32_t hash, const 
 
 void find_texture_overrides_for_resource(ID3D11Resource *resource, TextureOverrideMatches *matches, DrawCallInfo *call_info)
 {
-	D3D11_RESOURCE_DIMENSION dimension;
-	ID3D11Buffer *buf = NULL;
-	ID3D11Texture1D *tex1d = NULL;
-	ID3D11Texture2D *tex2d = NULL;
-	ID3D11Texture3D *tex3d = NULL;
-	D3D11_BUFFER_DESC buf_desc;
-	D3D11_TEXTURE1D_DESC tex1d_desc;
-	D3D11_TEXTURE2D_DESC tex2d_desc;
-	D3D11_TEXTURE3D_DESC tex3d_desc;
-
-	find_texture_override_for_resource_by_hash(resource, matches, call_info);
-	if (!matches->empty()) {
-		// If we got a result it was matched by hash - that's an exact
-		// match and we don't process any fuzzy matches
+	if (G->mTextureOverrideMap.empty() && G->mFuzzyTextureOverrides.empty())
 		return;
+
+	Profiling::State profiling_state;
+	size_t matches_before = 0;
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		matches_before = matches->size();
+		Profiling::texture_override_candidates_lookup_overhead.count++;
+		Profiling::start(&profiling_state);
 	}
 
-	resource->GetType(&dimension);
-	switch (dimension) {
-		case D3D11_RESOURCE_DIMENSION_BUFFER:
-			buf = (ID3D11Buffer*)resource;
-			buf->GetDesc(&buf_desc);
-			return find_texture_overrides_for_desc(&buf_desc, matches, call_info);
-		case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
-			tex1d = (ID3D11Texture1D*)resource;
-			tex1d->GetDesc(&tex1d_desc);
-			return find_texture_overrides_for_desc(&tex1d_desc, matches, call_info);
-		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
-			tex2d = (ID3D11Texture2D*)resource;
-			tex2d->GetDesc(&tex2d_desc);
-			return find_texture_overrides_for_desc(&tex2d_desc, matches, call_info);
-		case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
-			tex3d = (ID3D11Texture3D*)resource;
-			tex3d->GetDesc(&tex3d_desc);
-			return find_texture_overrides_for_desc(&tex3d_desc, matches, call_info);
+	// Hash matches first, then fuzzy matches, as the uncached lookup did.
+	// Resources without handle info (custom resources, back buffer, shared
+	// resources) have no candidates and match nothing:
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	TextureOverrideCandidates *candidates = get_texture_override_candidates(resource);
+	if (candidates) {
+		if (candidates->hash_matches) {
+			for (TextureOverride &to : *candidates->hash_matches) {
+				if (matches_draw_info(&to, call_info))
+					matches->push_back(&to);
+			}
+		}
+		for (TextureOverride *to : candidates->fuzzy_matches) {
+			if (matches_draw_info(to, call_info))
+				matches->push_back(to);
+		}
+	}
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	if (Profiling::mode == Profiling::Mode::SUMMARY) {
+		Profiling::end(&profiling_state, &Profiling::texture_override_candidates_lookup_overhead);
+		if (matches->size() > matches_before)
+			Profiling::texture_override_candidates_lookup_overhead.hits++;
 	}
 }
 
@@ -1770,369 +1961,652 @@ bool TextureOverrideLess(const struct TextureOverride &lhs, const struct Texture
 		return lhs.priority < rhs.priority;
 	return lhs.ini_section < rhs.ini_section;
 }
+
 bool FuzzyMatchResourceDescLess::operator() (const std::shared_ptr<FuzzyMatchResourceDesc> &lhs, const std::shared_ptr<FuzzyMatchResourceDesc> &rhs) const
 {
 	return TextureOverrideLess(*lhs->texture_override, *rhs->texture_override);
 }
 
-
-//--------------------------------------------------------------------------------------
-// Directly copied from DirectXTK code, as GetSurfaceInfo is not exposed in DirectXTK,
-// headers. But is simple enough to copy here.
-//--------------------------------------------------------------------------------------
-
-namespace DirectX
+// Initialize page versioning used for fast invalidation.
+// Each page tracks a monotonically increasing "version" that invalidates
+// all cached entries (offsets) that belong to that page.
+// NOTE: Pages do NOT store hashes; they only invalidate offset-based entries.
+void RegionHashesCache::Initialize(size_t buffer_size)
 {
-	namespace LoaderHelpers
+	if (data_size != buffer_size) {
+		//LogInfo("RegionHashesCache::Initialize buffer_size=%d \n", buffer_size);
+		UINT num_pages = (UINT)((buffer_size + PAGE_SIZE - 1) / PAGE_SIZE);
+		page_versions.assign(num_pages, 0);
+		if (cache)
+			cache->clear();
+	}
+	else
 	{
-		//--------------------------------------------------------------------------------------
-		// Return the BPP for a particular format
-		//--------------------------------------------------------------------------------------
-		inline size_t BitsPerPixel(_In_ DXGI_FORMAT fmt) noexcept
-		{
-			switch (fmt)
-			{
-			case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-			case DXGI_FORMAT_R32G32B32A32_FLOAT:
-			case DXGI_FORMAT_R32G32B32A32_UINT:
-			case DXGI_FORMAT_R32G32B32A32_SINT:
-				return 128;
+		Clear();
+	}
+}
 
-			case DXGI_FORMAT_R32G32B32_TYPELESS:
-			case DXGI_FORMAT_R32G32B32_FLOAT:
-			case DXGI_FORMAT_R32G32B32_UINT:
-			case DXGI_FORMAT_R32G32B32_SINT:
-				return 96;
+// Store hash together with the current page version.
+// This allows fast invalidation by comparing stored version vs current page version.
+void RegionHashesCache::Add(const RegionHashKeyL2& key, uint32_t hash)
+{
+	if (!cache)
+		cache = std::make_unique<FlatHashMap<RegionHashKeyL2, RegionCacheEntry, RegionHashKeyHasherL2>>(page_versions.size() / (PAGE_SIZE / HASHES_PER_PAGE));
 
-			case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-			case DXGI_FORMAT_R16G16B16A16_FLOAT:
-			case DXGI_FORMAT_R16G16B16A16_UNORM:
-			case DXGI_FORMAT_R16G16B16A16_UINT:
-			case DXGI_FORMAT_R16G16B16A16_SNORM:
-			case DXGI_FORMAT_R16G16B16A16_SINT:
-			case DXGI_FORMAT_R32G32_TYPELESS:
-			case DXGI_FORMAT_R32G32_FLOAT:
-			case DXGI_FORMAT_R32G32_UINT:
-			case DXGI_FORMAT_R32G32_SINT:
-			case DXGI_FORMAT_R32G8X24_TYPELESS:
-			case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-			case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-			case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
-			case DXGI_FORMAT_Y416:
-			case DXGI_FORMAT_Y210:
-			case DXGI_FORMAT_Y216:
-				return 64;
+	// Compute page index for this offset.
+	UINT page = key.offset / PAGE_SIZE;
+	if (page >= page_versions.size())
+		return;
 
-			case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-			case DXGI_FORMAT_R10G10B10A2_UNORM:
-			case DXGI_FORMAT_R10G10B10A2_UINT:
-			case DXGI_FORMAT_R11G11B10_FLOAT:
-			case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-			case DXGI_FORMAT_R8G8B8A8_UNORM:
-			case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-			case DXGI_FORMAT_R8G8B8A8_UINT:
-			case DXGI_FORMAT_R8G8B8A8_SNORM:
-			case DXGI_FORMAT_R8G8B8A8_SINT:
-			case DXGI_FORMAT_R16G16_TYPELESS:
-			case DXGI_FORMAT_R16G16_FLOAT:
-			case DXGI_FORMAT_R16G16_UNORM:
-			case DXGI_FORMAT_R16G16_UINT:
-			case DXGI_FORMAT_R16G16_SNORM:
-			case DXGI_FORMAT_R16G16_SINT:
-			case DXGI_FORMAT_R32_TYPELESS:
-			case DXGI_FORMAT_D32_FLOAT:
-			case DXGI_FORMAT_R32_FLOAT:
-			case DXGI_FORMAT_R32_UINT:
-			case DXGI_FORMAT_R32_SINT:
-			case DXGI_FORMAT_R24G8_TYPELESS:
-			case DXGI_FORMAT_D24_UNORM_S8_UINT:
-			case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-			case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-			case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
-			case DXGI_FORMAT_R8G8_B8G8_UNORM:
-			case DXGI_FORMAT_G8R8_G8B8_UNORM:
-			case DXGI_FORMAT_B8G8R8A8_UNORM:
-			case DXGI_FORMAT_B8G8R8X8_UNORM:
-			case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
-			case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-			case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-			case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-			case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-			case DXGI_FORMAT_AYUV:
-			case DXGI_FORMAT_Y410:
-			case DXGI_FORMAT_YUY2:
-#if (defined(_XBOX_ONE) && defined(_TITLE)) || defined(_GAMING_XBOX)
-			case DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT:
-			case DXGI_FORMAT_R10G10B10_6E4_A2_FLOAT:
-			case DXGI_FORMAT_R10G10B10_SNORM_A2_UNORM:
-#endif
-				return 32;
+	RegionCacheEntry entry;
+	entry.hash = hash;
+	entry.version = page_versions[page];
 
-			case DXGI_FORMAT_P010:
-			case DXGI_FORMAT_P016:
-#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10)
-			case DXGI_FORMAT_V408:
-#endif
-#if (defined(_XBOX_ONE) && defined(_TITLE)) || defined(_GAMING_XBOX)
-			case DXGI_FORMAT_D16_UNORM_S8_UINT:
-			case DXGI_FORMAT_R16_UNORM_X8_TYPELESS:
-			case DXGI_FORMAT_X16_TYPELESS_G8_UINT:
-#endif
-				return 24;
+	cache->insert(key, entry);
+}
 
-			case DXGI_FORMAT_R8G8_TYPELESS:
-			case DXGI_FORMAT_R8G8_UNORM:
-			case DXGI_FORMAT_R8G8_UINT:
-			case DXGI_FORMAT_R8G8_SNORM:
-			case DXGI_FORMAT_R8G8_SINT:
-			case DXGI_FORMAT_R16_TYPELESS:
-			case DXGI_FORMAT_R16_FLOAT:
-			case DXGI_FORMAT_D16_UNORM:
-			case DXGI_FORMAT_R16_UNORM:
-			case DXGI_FORMAT_R16_UINT:
-			case DXGI_FORMAT_R16_SNORM:
-			case DXGI_FORMAT_R16_SINT:
-			case DXGI_FORMAT_B5G6R5_UNORM:
-			case DXGI_FORMAT_B5G5R5A1_UNORM:
-			case DXGI_FORMAT_A8P8:
-			case DXGI_FORMAT_B4G4R4A4_UNORM:
-#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10)
-			case DXGI_FORMAT_P208:
-			case DXGI_FORMAT_V208:
-#endif
-				return 16;
+uint32_t RegionHashesCache::Get(const RegionHashKeyL2& key)
+{
+	if (!cache)
+		return 0;
 
-			case DXGI_FORMAT_NV12:
-			case DXGI_FORMAT_420_OPAQUE:
-			case DXGI_FORMAT_NV11:
-				return 12;
+	UINT page = key.offset / PAGE_SIZE;
+	if (page >= page_versions.size())
+		return 0;
 
-			case DXGI_FORMAT_R8_TYPELESS:
-			case DXGI_FORMAT_R8_UNORM:
-			case DXGI_FORMAT_R8_UINT:
-			case DXGI_FORMAT_R8_SNORM:
-			case DXGI_FORMAT_R8_SINT:
-			case DXGI_FORMAT_A8_UNORM:
-			case DXGI_FORMAT_BC2_TYPELESS:
-			case DXGI_FORMAT_BC2_UNORM:
-			case DXGI_FORMAT_BC2_UNORM_SRGB:
-			case DXGI_FORMAT_BC3_TYPELESS:
-			case DXGI_FORMAT_BC3_UNORM:
-			case DXGI_FORMAT_BC3_UNORM_SRGB:
-			case DXGI_FORMAT_BC5_TYPELESS:
-			case DXGI_FORMAT_BC5_UNORM:
-			case DXGI_FORMAT_BC5_SNORM:
-			case DXGI_FORMAT_BC6H_TYPELESS:
-			case DXGI_FORMAT_BC6H_UF16:
-			case DXGI_FORMAT_BC6H_SF16:
-			case DXGI_FORMAT_BC7_TYPELESS:
-			case DXGI_FORMAT_BC7_UNORM:
-			case DXGI_FORMAT_BC7_UNORM_SRGB:
-			case DXGI_FORMAT_AI44:
-			case DXGI_FORMAT_IA44:
-			case DXGI_FORMAT_P8:
-#if (defined(_XBOX_ONE) && defined(_TITLE)) || defined(_GAMING_XBOX)
-			case DXGI_FORMAT_R4G4_UNORM:
-#endif
-				return 8;
+	// Lookup exact offset (hot path, performance critical).
+	const RegionCacheEntry* entry = cache->find_ptr(key);
+	if (!entry)
+		return 0;
 
-			case DXGI_FORMAT_R1_UNORM:
-				return 1;
+	// Validate against page version
+	// If page version changed, this entry is stale.
+	if (entry->version != page_versions[page])
+		return 0;
 
-			case DXGI_FORMAT_BC1_TYPELESS:
-			case DXGI_FORMAT_BC1_UNORM:
-			case DXGI_FORMAT_BC1_UNORM_SRGB:
-			case DXGI_FORMAT_BC4_TYPELESS:
-			case DXGI_FORMAT_BC4_UNORM:
-			case DXGI_FORMAT_BC4_SNORM:
-				return 4;
+	return entry->hash;
+}
 
-			case DXGI_FORMAT_UNKNOWN:
-			case DXGI_FORMAT_FORCE_UINT:
-			default:
+size_t RegionHashesCache::GetSize()
+{
+	return cache ? cache->size() : 0;
+}
+
+// Invalidate a byte range by bumping page versions.
+// This avoids iterating over cache entries.
+void RegionHashesCache::Invalidate(UINT start, UINT end)
+{
+	if (page_versions.empty())
+		return;
+
+	UINT start_page = start / PAGE_SIZE;
+	if (start_page >= page_versions.size())
+		return;
+
+	UINT end_page = (end - 1) / PAGE_SIZE;
+	end_page = min(end_page, page_versions.size() - 1);
+
+	if (start_page > end_page)
+		return;
+
+	// Incrementing version invalidates ALL entries mapped to that page.
+	// This is O(pages), not O(entries), very important for performance.
+	for (UINT p = start_page; p <= end_page; ++p) {
+		++page_versions[p];
+	}
+
+	//LogInfo("RegionHashesCache::Invalidate start=%d, end=%d, start_page=%d, end_page=%d\n", start, end, start_page, end_page);
+}
+
+// Full reset of cache and versioning.
+// Used when buffer contents are fully replaced or invalid.
+void RegionHashesCache::Clear()
+{
+	//LogInfo("RegionHashesCache::Clear\n");
+	if (cache)
+		cache->clear();
+	// Reset all versions so existing entries (if any reused) become invalid.
+	std::fill(page_versions.begin(), page_versions.end(), 0);
+}
+
+// Initializes CPU-side snapshot buffer.
+// This buffer allows hashing without repeated GPU Map() calls.
+void ResourceHandleInfo::InitializeDataCache(size_t size, size_t offset)
+{
+	//LogInfo("InitializeDataCache size=%d\n", size);
+	cached_data.reset();
+	cached_data_offset = offset;
+	cached_data_size = size;
+
+	// Initialize region hashes cache.
+	if (!region_hashes_cache)
+		region_hashes_cache = std::make_unique<RegionHashesCache>();
+	// Initialize region cache for this buffer size.
+	region_hashes_cache->Initialize(size);
+}
+
+void ResourceHandleInfo::SetDataCache(void* src, size_t size)
+{
+	if (!src)
+		return;
+
+	InitializeDataCache(size);
+
+	// Adopt memory pointer as shared_ptr, no re-allocation involved.
+	cached_data = std::shared_ptr<uint8_t[]>(static_cast<uint8_t*>(src), free);
+
+	//cached_data_hash = crc32c_hw(0, GetCachedData(), size);
+	//LogInfo("SetDataCache size=%d, data_hash=%08lx\n", size, cached_data_hash);
+}
+
+void ResourceHandleInfo::SetDataCacheRegion(const void* src, size_t region_size, UINT offset)
+{
+	if (!src || !region_size)
+		return;
+
+	// Cannot write partial region if cache not initialized.
+	if (!cached_data_size) {
+		LogInfo("SetDataCacheRegion Failed (not initialized): offset=%d, region_size=%d!\n", offset, region_size);
+		return;
+	}
+
+	if (offset > cached_data_size || region_size > cached_data_size - offset){
+		LogInfo("SetDataCacheRegion Failed (out of bounds): offset=%d, region_size=%d, dst_size=%d!\n", offset, region_size, cached_data_size);
+		return;
+	}
+
+	//LogInfo("SetDataCacheRegion: offset=%d, region_size=%d!\n", offset, region_size);
+
+	// Recreate cache if it was invalidated but size is still known.
+	if (!cached_data) {
+		cached_data = std::shared_ptr<uint8_t[]>(new uint8_t[cached_data_size]);
+		cached_data_offset = 0;
+	}
+		
+	// Update only the affected region.
+	memcpy(GetCachedData() + offset, src, region_size);
+
+	// Invalidate only affected pages (cheap, avoids clearing the whole cache).
+	if (region_hashes_cache)
+		region_hashes_cache->Invalidate(offset, offset + (UINT)region_size);
+
+	//cached_data_hash = crc32c_hw(0, cached_data, cached_data_size);
+}
+
+uint8_t* ResourceHandleInfo::GetCachedData() {
+	return cached_data.get() + cached_data_offset;
+}
+
+// Clears all cached region hashes and invalidates the CPU-side buffer snapshot.
+// This forces region hashes to be recomputed the next time they are requested.
+void ResourceHandleInfo::ClearDataCache()
+{
+	if (!cached_data_size)
+		return;
+
+	//LogInfo("ResourceHandleInfo::ClearDataCache\n");
+
+	cached_data.reset();
+	cached_data_offset = 0;
+	cached_data_size = 0;
+
+	// Drop all cached hashes and CPU snapshot.
+	if (region_hashes_cache)
+		region_hashes_cache->Clear();
+}
+
+void ResourceHandleInfo::CacheRegionHash(const RegionHashKeyL2& key, uint32_t hash)
+{
+	if (region_hashes_cache)
+		region_hashes_cache->Add(key, hash);
+}
+
+uint32_t ResourceHandleInfo::GetCachedRegionHash(const RegionHashKeyL2& key)
+{
+	if (!region_hashes_cache)
+		return 0;
+	return region_hashes_cache->Get(key);
+}
+
+// Helper function that clears region hash cache for a specific D3D resource.
+// Used when the underlying resource contents may have changed.
+void ClearResourceRegionHashCache(ID3D11Resource* resource)
+{
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	ResourceHandleInfo* info = GetResourceHandleInfo(resource);
+	if (!info) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return;
+	}
+	info->ClearDataCache();
+	LeaveCriticalSection(&G->mCriticalSection);
+}
+
+// Creates a CPU-readable snapshot of the buffer contents and stores it
+// in handle_info->cached_data. The snapshot is taken through a staging
+// resource so the GPU buffer can be safely read by the CPU.
+static bool CacheBufferData(HackerContext* context, ID3D11Buffer* buffer, ResourceHandleInfo* handle_info)
+{
+	// WARNING: Everything below may cause GPU/CPU sync and stall.
+	// This is the slow path and should be rare.
+
+	ID3D11DeviceContext* mOrigContext1 = context->GetPassThroughOrigContext1();
+
+	// Query the buffer size.
+	D3D11_BUFFER_DESC desc;
+	buffer->GetDesc(&desc);
+
+	// Acquire a cached staging buffer. Buffers are pooled by size and reused
+	// across calls to avoid repeated CreateBuffer() overhead.
+	ID3D11Buffer* staging = context->GetReadbackBuffer(desc.ByteWidth);
+
+	if (!staging) {
+		LogInfo("CacheBufferData: Failed to acquire staging buffer\n");
+		return false;
+	}
+
+	// Allocate a CPU-owned copy. The mapped staging memory becomes invalid
+	// after Unmap(), so the contents must be copied before releasing it.
+	void* copy = malloc(desc.ByteWidth);
+	if (!copy) {
+		LogInfo("CacheBufferData: Out of memory\n");
+		return false;
+	}
+
+	// Copy the original GPU buffer contents into the staging buffer.
+	// Copy only the valid region. Staged destination buffer can be larger than source.
+	D3D11_BOX box = {};
+	box.left = 0;
+	box.right = desc.ByteWidth;
+	box.top = 0;
+	box.bottom = 1;
+	box.front = 0;
+	box.back = 1;
+
+	mOrigContext1->CopySubresourceRegion(staging, 0, 0, 0, 0, buffer, 0, &box);
+
+	// Map the staging buffer for CPU readback.
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+
+	if (FAILED(hr)) {
+		LogInfo("CacheBufferData: Map(D3D11_MAP_READ) failed (hr=0x%08X)\n", hr);
+		free(copy);
+		return false;
+	}
+
+	// Preserve the contents before unmapping the staging resource.
+	memcpy(copy, mapped.pData, desc.ByteWidth);
+
+	context->Unmap(staging, 0);
+
+	// Store a CPU copy of the entire buffer so region hashes can be
+	// computed without re-mapping the resource multiple times.
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	handle_info->SetDataCache(copy, desc.ByteWidth);
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	//handle_info->cached_data_hash = crc32c_hw(0, handle_info->cached_data, handle_info->cached_data_size);
+	//LogInfo("Fallback CacheBufferData size=%d, hash=%08lx, data_hash=%08lx, pResource=0x%p\n", desc.ByteWidth, handle_info->hash, handle_info->cached_data_hash, buffer);
+
+	return true;
+}
+
+UINT GetVertexBufferRegionOffset(UINT stride, DrawCallInfo* call_info, UINT byte_offset)
+{
+	UINT byte_size = stride * call_info->FirstVertex;
+	return byte_offset + byte_size;
+}
+
+UINT GetIndexBufferRegionOffset(DXGI_FORMAT format, DrawCallInfo* call_info, UINT byte_offset)
+{
+	UINT index_stride = (format == DXGI_FORMAT_R32_UINT) ? 4 : 2;
+	UINT byte_size = index_stride * call_info->FirstIndex;
+	return byte_offset + byte_size;
+}
+
+// Computes the byte size of the vertex buffer region used by a draw call.
+// Used to determine how much data should be hashed for change detection.
+UINT GetVertexBufferRegionSize(UINT stride, DrawCallInfo* call_info)
+{
+	// If VertexCount is not provided, estimate it from the index count.
+	// 0.15 * x + 3
+	UINT vertex_count = call_info->VertexCount > 0 ? call_info->VertexCount : (3 * call_info->IndexCount + 10) / 20 + 3;
+	UINT region_size = stride * vertex_count;
+	//LogInfo("GetVertexBufferRegionSize region_size=%d, stride=%d, VertexCount=%d, IndexCount=%d \n", region_size, stride, call_info->VertexCount, call_info->IndexCount);
+	return region_size;
+}
+
+// Computes the byte size of the index buffer region referenced by a draw call.
+UINT GetIndexBufferRegionSize(DXGI_FORMAT format, DrawCallInfo* call_info)
+{
+	UINT index_stride = (format == DXGI_FORMAT_R32_UINT) ? 4 : 2;
+	UINT region_size = index_stride * call_info->IndexCount;
+	//LogInfo("GetIndexBufferRegionSize region_size=%d, stride=%d, IndexCount=%d \n", region_size, index_stride, call_info->IndexCount);
+	return region_size;
+}
+
+// Global "L3" cache with per-frame reset in HackerSwapChain::Present.
+// Optimized for single global "entry point" into TextureOverride's, e.g. `CheckTextureOverride = ib` from global ShaderRegEx.
+// Usually, total number of handles is 5-10 times bigger than of ones bound to some specific slot.
+// So lookup in dedicated continuous container is expected to be always faster than one in huge unordered map. 
+FlatHashMap<RegionHashKeyL3, uint32_t, RegionHashKeyHasherL3> region_hashes_global_cache(1024);
+
+void ClearRegionHashesGlobalCache()
+{
+	region_hashes_global_cache.clear();
+}
+
+// Returns a CRC32 hash for a specific region of the buffer.
+// The hash is cached per offset to avoid recomputing it for repeated draw calls.
+// When `custom_resource` is supplied, it's used instead of a `buffer` as input.
+uint32_t GetRegionHash(HackerContext* context, ID3D11Buffer* buffer, UINT offset, UINT size, CustomResource* custom_resource)
+{
+	if (!context || !buffer || !size) {
+		return 0;
+	}
+
+	// Lookup offset in fast L3 cache without any locking involved.
+	RegionHashKeyL3 level_3_cache_key{ (uint64_t)buffer, offset, size };
+	if (uint32_t* h = region_hashes_global_cache.find_ptr(level_3_cache_key))
+	{
+		//LogInfo("GetRegionHash: From L3 cache: hash=%08lx, offset=%d, size=%d, pResource=0x%p, cache_size=%d \n", *h, offset, size, buffer, region_hashes_global_cache.size());
+		return *h;
+	}
+
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+
+	// Acquire HandleInfo. For dozens of thousands of handles in unordered_map, usually it's more expensive than L3 cache lookup. 
+	ResourceHandleInfo* handle_info = (custom_resource == nullptr) ? GetResourceHandleInfo(buffer) : custom_resource->GetHandleInfo();
+	if (!handle_info) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return 0;
+	}
+
+	uint32_t hash;
+
+	// Lookup offset in L2 cache. This one is slower and requires `handle_info` lookup.
+	RegionHashKeyL2 level_2_cache_key{ (uint64_t)offset, size };
+	hash = handle_info->GetCachedRegionHash(level_2_cache_key);
+	if (hash) {
+		region_hashes_global_cache.insert(level_3_cache_key, hash);
+		LeaveCriticalSection(&G->mCriticalSection);
+		//LogInfo("GetRegionHash: From L2 cache: hash=%08lx, offset=%d, size=%d, full_hash=%08lx, pResource=0x%p, cache_size=%d \n", hash, offset, size, handle_info->hash, buffer, handle_info->region_hashes_cache->GetSize());
+		return hash;
+	}
+
+	// Check if cached buffer snapshot exists in RAM
+	if (!handle_info->cached_data_size) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		if (custom_resource == nullptr) {
+			// Stall GPU to fetch buffer data from VRAM.
+			if (!CacheBufferData(context, buffer, handle_info)) {
+				return 0;
+			}
+		} else {
+			// Region hashing of custom resources is allowed only for lightweight "views" to cached pipeline data (ref or full copies).
+			// Avoid stalling GPU for custom resources if data is not available.
+			return 0;
+		}
+		EnterCriticalSectionPretty(&G->mCriticalSection);
+	}
+
+	// Pointer to the start of the requested region within the cached buffer cannot be outside of upper bound.
+	if (offset >= handle_info->cached_data_size) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return 0;
+	}
+
+	// Upper bound of requested region must stay within the buffer size.
+	UINT max_region_size = handle_info->cached_data_size - offset;
+	if (size > max_region_size) {
+		size = max_region_size;
+	}
+
+	// Make pointer for given offset in L1 cache (raw data).
+	const uint8_t* ptr = handle_info->GetCachedData() + offset;
+
+	// Compute CRC32 hash for the region.
+	hash = crc32c_hw(0, ptr, size);
+
+	// Store computed region hash in the L2 cache (local per ResourceHandleInfo).
+	handle_info->CacheRegionHash(level_2_cache_key, hash);
+	// Store computed region hash in the L3 cache (global per-frame).
+	region_hashes_global_cache.insert(level_3_cache_key, hash);
+
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	//LogInfo("GetRegionHash: New hash: frame=%d, hash=%08lx, offset=%d, size=%d, full_hash=%08lx, pResource=0x%p, cache_size=%d, data_hash=%08lx \n", G->frame_no, hash, offset, size, handle_info->hash, buffer, handle_info->region_hashes_cache->GetSize(), handle_info->cached_data_hash);
+
+	return hash;
+}
+
+float BitCastToFloat(uint32_t bits)
+{
+	float value;
+	memcpy(&value, &bits, sizeof(value));
+	return value;
+}
+
+uint32_t BitCastToUint(float bits)
+{
+	uint32_t value;
+	memcpy(&value, &bits, sizeof(value));
+	return value;
+}
+
+float EncodeFloat30(const uint32_t hash)
+{
+	// IEEE-754 float layout:
+	//   [ sign:1 ][ exponent:8 ][ mantissa:23 ]
+	//
+	// We encode 30 bits as:
+	//   [ exponent payload:7 ][ mantissa payload:23 ]
+	//
+	// The sign bit is always zero, and the exponent range is limited to [1, 128] so we never produce:
+	//   exponent == 0   -> zero / subnormal values
+	//   exponent == 255 -> infinity / NaN values
+	//
+	// This guarantees that float equality behaves exactly like integer equality for all encoded values.
+
+	// Keep 30 bits.
+	constexpr uint32_t payload_mask = 0x3FFFFFFFu; // Lower 30 bits
+	uint32_t payload = hash & payload_mask;
+
+	// Upper 7 bits become the exponent.
+	// Add 1 so the exponent range is [1, 128] instead of [0, 127].
+	uint32_t exponent = 1u + (payload >> 23);
+
+	// Lower 23 bits become the mantissa.
+	constexpr uint32_t mantissa_mask = 0x007FFFFFu; // Lower 23 bits
+	uint32_t mantissa = payload & mantissa_mask;
+
+	// Construct the final IEEE-754 bit pattern.
+	uint32_t float_bits = (exponent << 23) | mantissa;
+
+	// TODO: Replace with std::bit_cast<float> after C++20 upgrade
+	return BitCastToFloat(float_bits);
+}
+
+uint64_t HashPointer(const void* p)
+{
+	uint64_t x = reinterpret_cast<uint64_t>(p);
+
+	x ^= x >> 33;
+	x *= 0xff51afd7ed558ccdULL;  // Murmur finalizer for better bit-mixing
+	x ^= x >> 33;
+
+	return x;
+}
+
+uint32_t HashUnsigned32(uint32_t u)
+{
+	u ^= u >> 16;
+	u *= 0x85ebca6b; // Murmur finalizer for better bit-mixing
+	u ^= u >> 13;
+
+	return u;
+}
+
+// Number of bits allocated to each axis.
+constexpr uint32_t X_BITS = 12; // Points to the right.
+constexpr uint32_t Y_BITS = 8;  // Points straight up.
+constexpr uint32_t Z_BITS = 12; // Points away from the camera (depth increases deeper into the screen).
+
+constexpr uint32_t X_MASK = (1u << X_BITS) - 1; // 4095
+constexpr uint32_t Y_MASK = (1u << Y_BITS) - 1; // 255
+constexpr uint32_t Z_MASK = (1u << Z_BITS) - 1; // 4095
+
+constexpr uint32_t X_SIZE = 1u << X_BITS; // 4096
+constexpr uint32_t Y_SIZE = 1u << Y_BITS; // 256
+constexpr uint32_t Z_SIZE = 1u << Z_BITS; // 4096
+
+constexpr uint32_t X_SHIFT = Y_BITS + Z_BITS;
+constexpr uint32_t Y_SHIFT = Z_BITS;
+constexpr uint32_t Z_SHIFT = 0;
+
+// Quantizes XYZ coords to grid cells.
+inline int32_t WorldToCell(float v, float cell_size)
+{
+	return (int32_t)std::floor(v / cell_size);
+}
+
+// Wraps coordinate into the representable range for a given axis, forcing it to stay within 4096x256x4096 cells grid. 
+// Coordinates are stored modulo the axis size, effectively treating the grid as a torus along each dimension.
+inline uint32_t WrapCellCoord(int32_t c, uint32_t mask)
+{
+    return static_cast<uint32_t>(c) & mask;
+}
+
+// Converts world position to grid cell coordinates and packs them into a 32-bit unsigned integer.
+// X and Z receive more bits because most scenes span a much larger horizontal area than vertical height.
+// Layout: [ X:12 bits ][ Y:8 bits ][ Z:12 bits ]
+uint32_t PackCellCoords(float x, float y, float z, float cell_size)
+{
+    return (WrapCellCoord(WorldToCell(x, cell_size), X_MASK) << X_SHIFT) |
+           (WrapCellCoord(WorldToCell(y, cell_size), Y_MASK) << Y_SHIFT) |
+            WrapCellCoord(WorldToCell(z, cell_size), Z_MASK);
+}
+
+// Unpacks packed grid coordinates back into their wrapped integer ranges:
+//   X: 0..4095, Y: 0..255, Z: 0..4095
+GridPos UnpackCellCoords(uint32_t packed)
+{
+	return {
+		(packed >> (Y_BITS + Z_BITS)) & X_MASK,
+		(packed >> Z_BITS) & Y_MASK,
+		 packed & Z_MASK
+	};
+}
+
+// Computes the shortest wrapped distance between two coordinates along a single axis.
+template <uint32_t Size>
+inline uint32_t AxisDistance(uint32_t a, uint32_t b)
+{
+	uint32_t d = (a > b) ? (a - b) : (b - a);
+
+	// Wrap around the torus.
+	uint32_t wrapped = Size - d;
+	return d < wrapped ? d : wrapped;
+}
+
+// Computes Chebyshev distance between two packed grid positions.
+// Diagonal movement has the same cost as axis-aligned movement:
+//   0 0      0 1
+//   1 0  ->  0 0
+//         ^- Chebyshev Distance == 1.
+uint32_t SpatialDistanceChebyshev(const GridPos& a, const GridPos& b)
+{
+	uint32_t dx = AxisDistance<X_SIZE>(a.x, b.x);
+	uint32_t dy = AxisDistance<Y_SIZE>(a.y, b.y);
+	uint32_t dz = AxisDistance<Z_SIZE>(a.z, b.z);
+
+	return (std::max)(dx, (std::max)(dy, dz));
+}
+
+// Returns the packed 4096x256x4096 cell grid coordinates corresponding to the world position.
+// The packed value can be compared directly for cell equality and stored in single 32-bit container.
+// When `custom_resource` is supplied, it's used instead of a `buffer` as input.
+uint32_t GetSpatialHash(HackerContext* context, ID3D11Buffer* buffer, UINT offset_x, UINT offset_y, UINT offset_z, float cell_size, CustomResource* custom_resource)
+{
+	if (!context || !buffer) {
+		return 0;
+	}
+
+	// Use zero size to share the cache with region hashes, which are always non-zero.
+	uint32_t size = 0;
+
+	// Lookup offset in fast L3 cache without any locking involved.
+	//RegionHashKeyL3 level_3_cache_key{ (uint64_t)buffer, offset_x, size };
+	//if (uint32_t* h = region_hashes_global_cache.find_ptr(level_3_cache_key))
+	//{
+	//	//LogInfo("GetSpatialHash: From L3 cache: hash=%08lx, pResource=0x%p, cache_size=%d \n", *h, buffer, region_hashes_global_cache.size());
+	//	return *h;
+	//}
+
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+
+	// Acquire HandleInfo. For dozens of thousands of handles in unordered_map, usually it's more expensive than L3 cache lookup. 
+	ResourceHandleInfo* handle_info = (custom_resource == nullptr) ? GetResourceHandleInfo(buffer) : custom_resource->GetHandleInfo();
+	if (!handle_info) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return 0;
+	}
+
+	uint32_t hash;
+
+	// Lookup offset in L2 cache. This one is slower and requires `handle_info` lookup.
+	RegionHashKeyL2 level_2_cache_key{ (uint64_t)offset_x, size };
+	hash = handle_info->GetCachedRegionHash(level_2_cache_key);
+	if (hash) {
+		//region_hashes_global_cache.insert(level_3_cache_key, hash);
+		LeaveCriticalSection(&G->mCriticalSection);
+		//LogInfo("GetSpatialHash: From L2 cache: hash=%08lx, full_hash=%08lx, pResource=0x%p, cache_size=%d \n", hash, handle_info->hash, buffer, handle_info->region_hashes_cache->GetSize());
+		return hash;
+	}
+
+	// Check if cached buffer snapshot exists in RAM
+	if (!handle_info->cached_data_size) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		if (custom_resource == nullptr) {
+			// Stall GPU to fetch buffer data from VRAM.
+			if (!CacheBufferData(context, buffer, handle_info)) {
 				return 0;
 			}
 		}
-
-		//--------------------------------------------------------------------------------------
-		// Get surface information for a particular format
-		//--------------------------------------------------------------------------------------
-		inline HRESULT GetSurfaceInfo(
-			_In_ size_t width,
-			_In_ size_t height,
-			_In_ DXGI_FORMAT fmt,
-			_Out_opt_ size_t* outNumBytes,
-			_Out_opt_ size_t* outRowBytes,
-			_Out_opt_ size_t* outNumRows) noexcept
-		{
-			uint64_t numBytes = 0;
-			uint64_t rowBytes = 0;
-			uint64_t numRows = 0;
-
-			bool bc = false;
-			bool packed = false;
-			bool planar = false;
-			size_t bpe = 0;
-			switch (fmt)
-			{
-			case DXGI_FORMAT_UNKNOWN:
-				return E_INVALIDARG;
-
-			case DXGI_FORMAT_BC1_TYPELESS:
-			case DXGI_FORMAT_BC1_UNORM:
-			case DXGI_FORMAT_BC1_UNORM_SRGB:
-			case DXGI_FORMAT_BC4_TYPELESS:
-			case DXGI_FORMAT_BC4_UNORM:
-			case DXGI_FORMAT_BC4_SNORM:
-				bc = true;
-				bpe = 8;
-				break;
-
-			case DXGI_FORMAT_BC2_TYPELESS:
-			case DXGI_FORMAT_BC2_UNORM:
-			case DXGI_FORMAT_BC2_UNORM_SRGB:
-			case DXGI_FORMAT_BC3_TYPELESS:
-			case DXGI_FORMAT_BC3_UNORM:
-			case DXGI_FORMAT_BC3_UNORM_SRGB:
-			case DXGI_FORMAT_BC5_TYPELESS:
-			case DXGI_FORMAT_BC5_UNORM:
-			case DXGI_FORMAT_BC5_SNORM:
-			case DXGI_FORMAT_BC6H_TYPELESS:
-			case DXGI_FORMAT_BC6H_UF16:
-			case DXGI_FORMAT_BC6H_SF16:
-			case DXGI_FORMAT_BC7_TYPELESS:
-			case DXGI_FORMAT_BC7_UNORM:
-			case DXGI_FORMAT_BC7_UNORM_SRGB:
-				bc = true;
-				bpe = 16;
-				break;
-
-			case DXGI_FORMAT_R8G8_B8G8_UNORM:
-			case DXGI_FORMAT_G8R8_G8B8_UNORM:
-			case DXGI_FORMAT_YUY2:
-				packed = true;
-				bpe = 4;
-				break;
-
-			case DXGI_FORMAT_Y210:
-			case DXGI_FORMAT_Y216:
-				packed = true;
-				bpe = 8;
-				break;
-
-			case DXGI_FORMAT_NV12:
-			case DXGI_FORMAT_420_OPAQUE:
-				if ((height % 2) != 0)
-				{
-					// Requires a height alignment of 2.
-					return E_INVALIDARG;
-				}
-				planar = true;
-				bpe = 2;
-				break;
-
-#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10)
-
-			case DXGI_FORMAT_P208:
-				planar = true;
-				bpe = 2;
-				break;
-
-#endif
-
-			case DXGI_FORMAT_P010:
-			case DXGI_FORMAT_P016:
-				if ((height % 2) != 0)
-				{
-					// Requires a height alignment of 2.
-					return E_INVALIDARG;
-				}
-				planar = true;
-				bpe = 4;
-				break;
-
-#if (defined(_XBOX_ONE) && defined(_TITLE)) || defined(_GAMING_XBOX)
-
-			case DXGI_FORMAT_D16_UNORM_S8_UINT:
-			case DXGI_FORMAT_R16_UNORM_X8_TYPELESS:
-			case DXGI_FORMAT_X16_TYPELESS_G8_UINT:
-				planar = true;
-				bpe = 4;
-				break;
-
-#endif
-
-			default:
-				break;
-			}
-
-			if (bc)
-			{
-				uint64_t numBlocksWide = 0;
-				if (width > 0)
-				{
-					numBlocksWide = std::max<uint64_t>(1u, (uint64_t(width) + 3u) / 4u);
-				}
-				uint64_t numBlocksHigh = 0;
-				if (height > 0)
-				{
-					numBlocksHigh = std::max<uint64_t>(1u, (uint64_t(height) + 3u) / 4u);
-				}
-				rowBytes = numBlocksWide * bpe;
-				numRows = numBlocksHigh;
-				numBytes = rowBytes * numBlocksHigh;
-			}
-			else if (packed)
-			{
-				rowBytes = ((uint64_t(width) + 1u) >> 1) * bpe;
-				numRows = uint64_t(height);
-				numBytes = rowBytes * height;
-			}
-			else if (fmt == DXGI_FORMAT_NV11)
-			{
-				rowBytes = ((uint64_t(width) + 3u) >> 2) * 4u;
-				numRows = uint64_t(height) * 2u; // Direct3D makes this simplifying assumption, although it is larger than the 4:1:1 data
-				numBytes = rowBytes * numRows;
-			}
-			else if (planar)
-			{
-				rowBytes = ((uint64_t(width) + 1u) >> 1) * bpe;
-				numBytes = (rowBytes * uint64_t(height)) + ((rowBytes * uint64_t(height) + 1u) >> 1);
-				numRows = height + ((uint64_t(height) + 1u) >> 1);
-			}
-			else
-			{
-				const size_t bpp = BitsPerPixel(fmt);
-				if (!bpp)
-					return E_INVALIDARG;
-
-				rowBytes = (uint64_t(width) * bpp + 7u) / 8u; // round up to nearest byte
-				numRows = uint64_t(height);
-				numBytes = rowBytes * height;
-			}
-
-#if defined(_M_IX86) || defined(_M_ARM) || defined(_M_HYBRID_X86_ARM64)
-			static_assert(sizeof(size_t) == 4, "Not a 32-bit platform!");
-			if (numBytes > UINT32_MAX || rowBytes > UINT32_MAX || numRows > UINT32_MAX)
-				return HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW);
-#else
-			static_assert(sizeof(size_t) == 8, "Not a 64-bit platform!");
-#endif
-
-			if (outNumBytes)
-			{
-				*outNumBytes = static_cast<size_t>(numBytes);
-			}
-			if (outRowBytes)
-			{
-				*outRowBytes = static_cast<size_t>(rowBytes);
-			}
-			if (outNumRows)
-			{
-				*outNumRows = static_cast<size_t>(numRows);
-			}
-
-			return S_OK;
+		else {
+			// Region hashing of custom resources is allowed only for lightweight "views" to cached pipeline data (ref or full copies).
+			// Avoid stalling GPU for custom resources if data is not available.
+			return 0;
 		}
+		EnterCriticalSectionPretty(&G->mCriticalSection);
 	}
+
+	// Calculate the minimal buffer size required to fit requested X Y Z offsets.
+	UINT min_buffer_size = max(offset_x, offset_y, offset_z) * 4 + 4;
+
+	// Ensure upper bound does not exceed buffer size.
+	if (min_buffer_size >= handle_info->cached_data_size) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return 0;
+	}
+
+	// Make pointer for given offset in L1 cache (raw data).
+	const uint8_t* ptr = handle_info->GetCachedData();
+
+	const float* data = reinterpret_cast<const float*>(ptr);
+
+	// Compute spatial hash for the 3D coordinates.
+	hash = PackCellCoords(data[offset_x], data[offset_y], data[offset_z], cell_size);
+
+	// Store computed region hash in the L2 cache (local per ResourceHandleInfo).
+	handle_info->CacheRegionHash(level_2_cache_key, hash);
+	// Store computed region hash in the L3 cache (global per-frame).
+	//region_hashes_global_cache.insert(level_3_cache_key, hash);
+
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	//LogInfo("GetSpatialHash: New hash: frame=%d, hash=%08lx, x=%.3f, y=%.3f, z=%.3f, full_hash=%08lx, pResource=0x%p, cache_size=%d\n", G->frame_no, hash, data[offset_x], data[offset_y], data[offset_z], handle_info->hash, buffer, handle_info->region_hashes_cache->GetSize());
+
+	return hash;
 }

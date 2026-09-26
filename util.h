@@ -1,11 +1,11 @@
 #pragma once
 
+#include <typeinfo>
 #include <ctype.h>
 #include <wchar.h>
 #include <string>
 #include <vector>
 #include <map>
-#include <typeinfo>
 
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
@@ -13,7 +13,6 @@
 #include <D3Dcompiler.h>
 #include <d3d9.h>
 #include <DirectXMath.h>
-#include <vcruntime_typeinfo.h>
 
 #include "version.h"
 #include "log.h"
@@ -25,8 +24,6 @@
 #if MIGOTO_DX == 11
 #include "DirectX11\HookedDevice.h"
 #include "DirectX11\HookedContext.h"
-#elif MIGOTO_DX == 9
-#include "DirectX9\HookedDeviceDX9.h"
 #endif // MIGOTO_DX
 
 
@@ -51,7 +48,7 @@ const int INI_PARAMS_SIZE_WARNING = 256;
 // This critical section must be held to avoid race conditions when creating
 // any resource. The nvapi functions used to set the resource creation mode
 // affect global state, so if multiple threads are creating resources
-// simultaneously it is possible for a StereoMode override or stereo/mono copy
+// simultaneously it is possible for mono copy
 // on one thread to affect another. This should be taken before setting the
 // surface creation mode and released only after it has been restored. If the
 // creation mode is not being set it should still be taken around the actual
@@ -899,23 +896,33 @@ static HRESULT CreateTextFile(wchar_t *fullPath, string *asmText, bool overwrite
 static HRESULT CreateAsmTextFile(wchar_t* fileDirectory, UINT64 hash, const wchar_t* shaderType, 
 	const void *pShaderBytecode, size_t bytecodeLength, bool patch_cb_offsets)
 {
-	string asmText = BinaryToAsmText(pShaderBytecode, bytecodeLength, patch_cb_offsets);
-	if (asmText.empty())
-	{
-		return E_OUTOFMEMORY;
+	// TODO: Poorly added try catch. Must replace for a more robust solution in line with the rest of the codebase
+	// Specifically added to avoid crashes when the following error displays in the log:
+	// error exporting original shader: invalid string position
+	try {
+		string asmText = BinaryToAsmText(pShaderBytecode, bytecodeLength, patch_cb_offsets);
+		if (asmText.empty())
+		{
+			return E_OUTOFMEMORY;
+		}
+
+		wchar_t fullPath[MAX_PATH];
+		swprintf_s(fullPath, MAX_PATH, L"%ls\\%016llx-%ls.txt", fileDirectory, hash, shaderType);
+
+		HRESULT hr = CreateTextFile(fullPath, &asmText, false);
+
+		if (SUCCEEDED(hr))
+			LogInfoW(L"    storing disassembly to %s\n", fullPath);
+		else
+			LogInfoW(L"    error: %x, storing disassembly to %s\n", hr, fullPath);
+
+		return hr;
 	}
-
-	wchar_t fullPath[MAX_PATH];
-	swprintf_s(fullPath, MAX_PATH, L"%ls\\%016llx-%ls.txt", fileDirectory, hash, shaderType);
-
-	HRESULT hr = CreateTextFile(fullPath, &asmText, false);
-
-	if (SUCCEEDED(hr))
-		LogInfoW(L"    storing disassembly to %s\n", fullPath);
-	else
-		LogInfoW(L"    error: %x, storing disassembly to %s\n", hr, fullPath);
-
-	return hr;
+	catch (const std::exception& e)
+	{
+		LogInfoW(L"    CreateAsmTextFile exception: %hs\n", e.what());
+		return E_FAIL;
+	}
 }
 
 // Specific variant to name files, so we know they are HLSL text.
@@ -1577,3 +1584,27 @@ extern IDXGISwapChain *last_fullscreen_swap_chain;
 #endif // MIGOTO_DX == 11
 void install_crash_handler(int level);
 float get_effective_dpi();
+uint32_t popcount(uint32_t x);
+float random(float max);
+uint64_t GetSystemTicks();
+
+class FPSCounter
+{
+public:
+	FPSCounter(float smoothing = 0.1f, float min_fps = 1.0f) : 
+		m_smoothing((std::max)(0.0f, (std::min)(smoothing, 1.0f))), // TODO C++17: m_smoothing(std::clamp(smoothing, 0.0f, 1.0f))
+		m_max_delta(static_cast<uint64_t>(1'000'000.0f / (std::max)(min_fps, 0.001f)))
+	{}
+
+	void Update(uint64_t system_tick_count);
+	float GetFPS() const;
+
+private:
+	float m_smoothing;
+	uint64_t m_max_delta;
+
+	uint64_t m_last_tick = 0;
+	float m_average_frame_time = 0.0f;
+	float m_fps = 0.0f;
+	bool m_initialized = false;
+};

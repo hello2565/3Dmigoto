@@ -19,7 +19,6 @@
 #include <D3Dcompiler.h>
 #include <codecvt>
 
-#include "nvapi.h"
 #include "log.h"
 #include "util.h"
 #include "shader.h"
@@ -34,6 +33,7 @@
 #include "ShaderRegex.h"
 #include "CommandList.h"
 #include "Hunting.h"
+#include "ByteCodeReader.h"
 
 // A map to look up the HackerDevice from an IUnknown. The reason for using an
 // IUnknown as the key is that an ID3D11Device and IDXGIDevice are actually two
@@ -241,7 +241,6 @@ static void unregister_hacker_device(HackerDevice *hacker_device)
 // -----------------------------------------------------------------------------------------------
 
 HackerDevice::HackerDevice(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pContext1) : 
-	mStereoHandle(0), mStereoResourceView(0), mStereoTexture(0),
 	mIniResourceView(0), mIniTexture(0),
 	mZBufferResourceView(0)
 {
@@ -250,71 +249,6 @@ HackerDevice::HackerDevice(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pConte
 	mOrigContext1 = pContext1;
 	// Must be done after mOrigDevice1 is set:
 	mUnknown = register_hacker_device(this);
-}
-
-HRESULT HackerDevice::CreateStereoParamResources()
-{
-	HRESULT hr;
-	NvAPI_Status nvret;
-
-	// We use the original device here. Functionally it should not matter
-	// if we use the HackerDevice, but it does result in a lot of noise in
-	// the frame analysis log as every call into nvapi using the
-	// mStereoHandle calls Begin() and End() on the immediate context.
-
-	// Todo: This call will fail if stereo is disabled. Proper notification?
-	nvret = NvAPI_Stereo_CreateHandleFromIUnknown(mOrigDevice1, &mStereoHandle);
-	if (nvret != NVAPI_OK)
-	{
-		mStereoHandle = 0;
-		LogInfo("HackerDevice::CreateStereoParamResources NvAPI_Stereo_CreateHandleFromIUnknown failed: %d\n", nvret);
-		return nvret;
-	}
-	mParamTextureManager.mStereoHandle = mStereoHandle;
-	LogInfo("  created NVAPI stereo handle. Handle = %p\n", mStereoHandle);
-
-	// Create stereo parameter texture.
-	LogInfo("  creating stereo parameter texture.\n");
-
-	D3D11_TEXTURE2D_DESC desc;
-	memset(&desc, 0, sizeof(D3D11_TEXTURE2D_DESC));
-	desc.Width = nv::stereo::ParamTextureManagerD3D11::Parms::StereoTexWidth;
-	desc.Height = nv::stereo::ParamTextureManagerD3D11::Parms::StereoTexHeight;
-	desc.MipLevels = 1;
-	desc.ArraySize = 1;
-	desc.Format = nv::stereo::ParamTextureManagerD3D11::Parms::StereoTexFormat;
-	desc.SampleDesc.Count = 1;
-	desc.SampleDesc.Quality = 0;
-	desc.Usage = D3D11_USAGE_DEFAULT;
-	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	desc.CPUAccessFlags = 0;
-	desc.MiscFlags = 0;
-	hr = mOrigDevice1->CreateTexture2D(&desc, 0, &mStereoTexture);
-	if (FAILED(hr))
-	{
-		LogInfo("    call failed with result = %x.\n", hr);
-		return hr;
-	}
-	LogInfo("    stereo texture created, handle = %p\n", mStereoTexture);
-
-	// Since we need to bind the texture to a shader input, we also need a resource view.
-	LogInfo("  creating stereo parameter resource view.\n");
-
-	D3D11_SHADER_RESOURCE_VIEW_DESC descRV;
-	memset(&descRV, 0, sizeof(D3D11_SHADER_RESOURCE_VIEW_DESC));
-	descRV.Format = desc.Format;
-	descRV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-	descRV.Texture2D.MostDetailedMip = 0;
-	descRV.Texture2D.MipLevels = -1;
-	hr = mOrigDevice1->CreateShaderResourceView(mStereoTexture, &descRV, &mStereoResourceView);
-	if (FAILED(hr))
-	{
-		LogInfo("    call failed with result = %x.\n", hr);
-		return hr;
-	}
-
-	LogInfo("    stereo texture resource view created, handle = %p.\n", mStereoResourceView);
-	return S_OK;
 }
 
 HRESULT HackerDevice::CreateIniParamResources()
@@ -417,27 +351,54 @@ void HackerDevice::CreatePinkHuntingResources()
 	}
 }
 
-HRESULT HackerDevice::SetGlobalNVSurfaceCreationMode()
+HackerInputLayout* HackerDevice::FindCachedInputLayout(uint64_t hash)
 {
-	HRESULT hr;
+	EnterCriticalSectionPretty(&G->mCriticalSection);
 
-	// Override custom settings.
-	if (mStereoHandle && G->gSurfaceCreateMode >= 0)
-	{
-		NvAPIOverride();
-		LogInfo("  setting custom surface creation mode.\n");
+	auto it = mInputLayoutCache.find(hash);
 
-		hr = Profiling::NvAPI_Stereo_SetSurfaceCreationMode(mStereoHandle,	(NVAPI_STEREO_SURFACECREATEMODE)G->gSurfaceCreateMode);
-		if (hr != NVAPI_OK)
-		{
-			LogInfo("    custom surface creation call failed: %d.\n", hr);
-			return hr;
-		}
+	if (it == mInputLayoutCache.end()) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return nullptr;
 	}
 
-	return S_OK;
+	HackerInputLayout* layout = it->second;
+	layout->AddRef();
+
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	return layout;
 }
 
+void HackerDevice::CacheInputLayout(uint64_t hash, HackerInputLayout* layout)
+{
+	if (!layout)
+		return;
+
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+
+	auto result = mInputLayoutCache.emplace(hash, layout);
+
+	if (result.second)
+		layout->AddRef();
+
+	LeaveCriticalSection(&G->mCriticalSection);
+}
+
+void HackerDevice::ClearInputLayoutCache()
+{
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+
+	auto cache = std::move(mInputLayoutCache);
+
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	for (auto& entry : cache)
+	{
+		if (entry.second)
+			entry.second->Release();
+	}
+}
 
 // With the addition of full DXGI support, this init sequence is too dangerous
 // to do at object creation time.  The NV CreateHandleFromIUnknown calls back
@@ -448,17 +409,11 @@ void HackerDevice::Create3DMigotoResources()
 	LogInfo("HackerDevice::Create3DMigotoResources(%s@%p) called.\n", type_name(this), this);
 
 	// XXX: Ignoring the return values for now because so do our callers.
-	// If we want to change this, keep in mind that failures in
-	// CreateStereoParamResources and SetGlobalNVSurfaceCreationMode should
-	// be considdered non-fatal, as stereo could be disabled in the control
-	// panel, or we could be on an AMD or Intel card.
 
 	LockResourceCreationMode();
 
-	CreateStereoParamResources();
 	CreateIniParamResources();
 	CreatePinkHuntingResources();
-	SetGlobalNVSurfaceCreationMode();
 
 	UnlockResourceCreationMode();
 
@@ -1415,9 +1370,6 @@ bool HackerDevice::NeedOriginalShader(UINT64 hash)
 		return true;
 	}
 
-	if (shaderOverride->partner_hash)
-		return true;
-
 	return false;
 }
 
@@ -1538,26 +1490,10 @@ STDMETHODIMP_(ULONG) HackerDevice::Release(THIS)
 			LogInfo("HackerDevice::Release counter=%d, this=%p\n", ulRef, this);
 		LogInfo("  deleting self\n");
 
+		ClearInputLayoutCache();
+
 		unregister_hacker_device(this);
 
-		if (mStereoHandle)
-		{
-			int result = NvAPI_Stereo_DestroyHandle(mStereoHandle);
-			mStereoHandle = 0;
-			LogInfo("  releasing NVAPI stereo handle, result = %d\n", result);
-		}
-		if (mStereoResourceView)
-		{
-			long result = mStereoResourceView->Release();
-			mStereoResourceView = 0;
-			LogInfo("  releasing stereo parameters resource view, result = %d\n", result);
-		}
-		if (mStereoTexture)
-		{
-			long result = mStereoTexture->Release();
-			mStereoTexture = 0;
-			LogInfo("  releasing stereo texture, result = %d\n", result);
-		}
 		if (mIniResourceView)
 		{
 			long result = mIniResourceView->Release();
@@ -1620,7 +1556,7 @@ HRESULT STDMETHODCALLTYPE HackerDevice::QueryInterface(
 	HRESULT hr = mOrigDevice1->QueryInterface(riid, ppvObject);
 	if (FAILED(hr))
 	{
-		LogInfo("  failed result = %x for %p\n", hr, ppvObject);
+		LogDebug("  failed result = %x for %p\n", hr, ppvObject);
 		return hr;
 	}
 
@@ -1687,6 +1623,31 @@ STDMETHODIMP HackerDevice::CreateUnorderedAccessView(THIS_
 	/* [annotation] */
 	__out_opt  ID3D11UnorderedAccessView **ppUAView)
 {
+	if (pDesc) {
+		TextureOverrideMatches matches;
+		
+		find_texture_overrides_for_resource(pResource, &matches, NULL);
+
+		if (!matches.empty()) {
+			TextureOverride* textureOverride = NULL;
+			int override_num_elements = -1;
+
+			for (unsigned i = 0; i < matches.size(); i++) {
+				textureOverride = matches[i];
+				if (textureOverride->override_num_elements > override_num_elements) {
+					override_num_elements = textureOverride->override_num_elements - pDesc->Buffer.FirstElement;
+				}
+			}
+
+			if (override_num_elements != -1 && pDesc->Buffer.NumElements < override_num_elements) {
+				D3D11_UNORDERED_ACCESS_VIEW_DESC pNewDesc = *pDesc;
+				pNewDesc.Buffer.NumElements = override_num_elements;
+				//LogOverlayW(LOG_INFO, L"UAV resized: %d->%d\n", pDesc->Buffer.NumElements, override_num_elements);
+				return mOrigDevice1->CreateUnorderedAccessView(pResource, &pNewDesc, ppUAView);
+			}
+		}
+	}
+
 	return mOrigDevice1->CreateUnorderedAccessView(pResource, pDesc, ppUAView);
 }
 
@@ -1714,6 +1675,111 @@ STDMETHODIMP HackerDevice::CreateDepthStencilView(THIS_
 	return mOrigDevice1->CreateDepthStencilView(pResource, pDesc, ppDepthStencilView);
 }
 
+HRESULT HackerDevice::CreateInputLayoutInternal(
+	const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs,
+	UINT NumElements,
+	const void* pShaderBytecodeWithInputSignature,
+	SIZE_T BytecodeLength,
+	uint64_t hash,
+	HackerInputLayout** ppLayout)
+{
+	if (!ppLayout)
+		return E_INVALIDARG;
+
+	*ppLayout = nullptr;
+
+	ID3D11InputLayout* orig = nullptr;
+	HRESULT hr = mOrigDevice1->CreateInputLayout(pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength, &orig);
+
+	if (FAILED(hr))
+	{
+		LogDebug("  Native CreateInputLayout failed: result=%x orig=%p\n", hr, orig);
+		return hr;
+	}
+
+	if (SUCCEEDED(hr) && !orig)
+	{
+		LogDebug("  Native CreateInputLayout returned success with null layout\n");
+		return E_FAIL;
+	}
+
+	try
+	{
+		auto* layout = new HackerInputLayout(orig, pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength, hash);
+
+		orig = nullptr;
+		*ppLayout = layout;
+
+		LogDebug("  New input layout handle=%p hash=%016llx\n", layout, hash);
+		return S_OK;
+	}
+	catch (const std::bad_alloc&)
+	{
+		LogDebug("  EXCEPTION: std::bad_alloc creating input layout (NumElements=%u BytecodeLength=%zu hash=%016llx orig=%p)\n",
+			NumElements, BytecodeLength, hash, orig);
+		orig->Release();
+		return E_OUTOFMEMORY;
+	}
+	catch (const std::exception& e)
+	{
+		LogDebug("  EXCEPTION: %s creating input layout (NumElements=%u BytecodeLength=%zu hash=%016llx orig=%p)\n",
+			e.what(), NumElements, BytecodeLength, hash, orig);
+		orig->Release();
+		return E_FAIL;
+	}
+	catch (...)
+	{
+		LogDebug("  EXCEPTION: unknown exception creating input layout (NumElements=%u BytecodeLength=%zu hash=%016llx orig=%p)\n",
+			NumElements, BytecodeLength, hash, orig);
+		orig->Release();
+		return E_FAIL;
+	}
+}
+
+STDMETHODIMP HackerDevice::CreateCustomInputLayout(THIS_
+	/* [annotation] */
+	__in_ecount(NumElements)  const D3D11_INPUT_ELEMENT_DESC *pInputElementDescs,
+	/* [annotation] */
+	__in_range(0, D3D11_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT)  UINT NumElements,
+	/* [annotation] */
+	__in  const void *pShaderBytecodeWithInputSignature,
+	/* [annotation] */
+	__in  SIZE_T BytecodeLength,
+	/* [annotation] */
+	__out_opt  ID3D11InputLayout **ppInputLayout)
+{
+	LogDebug("HackerDevice::CreateCustomInputLayout(%s@%p) called ppInputLayout=%p pShaderSignature=%p BytecodeLength=%zu\n",
+		type_name(this), this, ppInputLayout, pShaderBytecodeWithInputSignature, BytecodeLength);
+
+	if (!ppInputLayout)
+		return E_INVALIDARG;
+
+	*ppInputLayout = nullptr;
+
+	const uint64_t hash = CalculateInputLayoutHash(pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength);
+
+	HackerInputLayout* cached = FindCachedInputLayout(hash);
+
+	if (cached)
+	{
+		*ppInputLayout = cached;
+		LogDebug("  Cached custom layout handle=%p hash=%016llx\n", cached, hash);
+		return S_OK;
+	}
+
+	HackerInputLayout* layout = nullptr;
+	HRESULT hr = CreateInputLayoutInternal(pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength, hash, &layout);
+
+	if (FAILED(hr))
+		return hr;
+
+	CacheInputLayout(hash, layout);
+	*ppInputLayout = layout;
+
+	LogDebug("  New custom layout handle=%p hash=%016llx\n", layout, hash);
+	return S_OK;
+}
+
 STDMETHODIMP HackerDevice::CreateInputLayout(THIS_
 	/* [annotation] */
 	__in_ecount(NumElements)  const D3D11_INPUT_ELEMENT_DESC *pInputElementDescs,
@@ -1726,31 +1792,24 @@ STDMETHODIMP HackerDevice::CreateInputLayout(THIS_
 	/* [annotation] */
 	__out_opt  ID3D11InputLayout **ppInputLayout)
 {
-	HRESULT ret;
-	ID3DBlob *blob;
+	LogDebug("HackerDevice::CreateInputLayout(%s@%p) called ppInputLayout=%p pShaderSignature=%p BytecodeLength=%zu\n",
+		type_name(this), this, ppInputLayout, pShaderBytecodeWithInputSignature, BytecodeLength);
 
-	ret = mOrigDevice1->CreateInputLayout(pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature,
-		BytecodeLength, ppInputLayout);
-
-	if (G->hunting && SUCCEEDED(ret) && ppInputLayout && *ppInputLayout) {
-		// When dumping vertex buffers to text file in frame analysis
-		// we want to use the input layout to decode the buffer, but
-		// DirectX provides no API to query this. So, we store a copy
-		// of the input layout in a blob inside the private data of the
-		// input layout object. The private data is slow to access, so
-		// we should not use this in a hot path, but for frame analysis
-		// it doesn't matter. We use a blob to manage releasing the
-		// backing memory, since the anonymous void* version of this
-		// API does not appear to free the private data on release.
-
-		if (SUCCEEDED(D3DCreateBlob(sizeof(D3D11_INPUT_ELEMENT_DESC) * NumElements, &blob))) {
-			memcpy(blob->GetBufferPointer(), pInputElementDescs, blob->GetBufferSize());
-			(*ppInputLayout)->SetPrivateDataInterface(InputLayoutDescGuid, blob);
-			blob->Release();
-		}
+	if (!ppInputLayout)
+	{
+		// Preserve the native API's validation-only behavior.
+		return mOrigDevice1->CreateInputLayout(pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength, nullptr);
 	}
 
-	return ret;
+	*ppInputLayout = nullptr;
+
+	HackerInputLayout* layout = nullptr;
+	HRESULT hr = CreateInputLayoutInternal(pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength, 0, &layout);
+
+	if (SUCCEEDED(hr))
+		*ppInputLayout = layout;
+
+	return hr;
 }
 
 STDMETHODIMP HackerDevice::CreateClassLinkage(THIS_
@@ -1981,19 +2040,6 @@ static bool check_texture_override_iteration(TextureOverride *textureOverride)
 	return false;
 }
 
-// Only Texture2D surfaces can be square. Use template specialisation to skip
-// the check on other resource types:
-template <typename DescType>
-static bool is_square_surface(DescType *desc) {
-	return false;
-}
-static bool is_square_surface(D3D11_TEXTURE2D_DESC *desc)
-{
-	return (desc && G->gSurfaceSquareCreateMode >= 0
-			&& desc->Width == desc->Height
-			&& (desc->Usage & D3D11_USAGE_IMMUTABLE) == 0);
-}
-
 // Template specialisations to override resource descriptions.
 // TODO: Refactor this to use common code with CustomResource.
 // TODO: Add overrides for BindFlags since they can affect the stereo mode.
@@ -2030,7 +2076,15 @@ static void override_resource_desc_common_2d_3d(DescType *desc, TextureOverride 
 	}
 }
 
-static void override_resource_desc(D3D11_BUFFER_DESC *desc, TextureOverride *textureOverride) {}
+static void override_resource_desc(D3D11_BUFFER_DESC *desc, TextureOverride *textureOverride) {
+	if (textureOverride->override_byte_width != -1) {
+		if (desc->ByteWidth < textureOverride->override_byte_width) {
+			LogInfo("  resizing buffer: %d->%d\n", desc->ByteWidth, textureOverride->override_byte_width);
+			//LogOverlayW(LOG_WARNING, L"Buffer resized: %d->%d\n - [%s]\n", desc->ByteWidth, textureOverride->override_byte_width, textureOverride->ini_section.c_str());
+			desc->ByteWidth = textureOverride->override_byte_width;
+		}
+	}
+}
 static void override_resource_desc(D3D11_TEXTURE1D_DESC *desc, TextureOverride *textureOverride) {}
 static void override_resource_desc(D3D11_TEXTURE2D_DESC *desc, TextureOverride *textureOverride)
 {
@@ -2043,25 +2097,13 @@ static void override_resource_desc(D3D11_TEXTURE3D_DESC *desc, TextureOverride *
 
 template <typename DescType>
 static const DescType* process_texture_override(uint32_t hash,
-		StereoHandle mStereoHandle,
 		const DescType *origDesc,
-		DescType *newDesc,
-		NVAPI_STEREO_SURFACECREATEMODE *oldMode)
+		DescType *newDesc)
 {
-	NVAPI_STEREO_SURFACECREATEMODE newMode = (NVAPI_STEREO_SURFACECREATEMODE) -1;
 	TextureOverrideMatches matches;
 	TextureOverride *textureOverride = NULL;
 	const DescType* ret = origDesc;
 	unsigned i;
-
-	*oldMode = (NVAPI_STEREO_SURFACECREATEMODE) -1;
-
-	// Check for square surfaces. We used to do this after processing the
-	// StereoMode in TextureOverrides, but realistically we always want the
-	// TextureOverrides to be able to override this since they are more
-	// specific, so now we do this first.
-	if (is_square_surface(origDesc))
-		newMode = (NVAPI_STEREO_SURFACECREATEMODE) G->gSurfaceSquareCreateMode;
 
 	find_texture_overrides(hash, origDesc, &matches, NULL);
 
@@ -2090,35 +2132,11 @@ static const DescType* process_texture_override(uint32_t hash,
 			if (!check_texture_override_iteration(textureOverride))
 				continue;
 
-			if (textureOverride->stereoMode != -1)
-				newMode = (NVAPI_STEREO_SURFACECREATEMODE) textureOverride->stereoMode;
-
 			override_resource_desc(newDesc, textureOverride);
 		}
 	}
 
-	LockResourceCreationMode();
-
-	if (newMode != (NVAPI_STEREO_SURFACECREATEMODE) -1) {
-		Profiling::NvAPI_Stereo_GetSurfaceCreationMode(mStereoHandle, oldMode);
-		NvAPIOverride();
-		LogInfo("    setting custom surface creation mode %d\n", newMode);
-
-		if (NVAPI_OK != Profiling::NvAPI_Stereo_SetSurfaceCreationMode(mStereoHandle, newMode))
-			LogInfo("      call failed.\n");
-	}
-
 	return ret;
-}
-
-static void restore_old_surface_create_mode(NVAPI_STEREO_SURFACECREATEMODE oldMode, StereoHandle mStereoHandle)
-{
-	if (oldMode != (NVAPI_STEREO_SURFACECREATEMODE) - 1) {
-		if (NVAPI_OK != Profiling::NvAPI_Stereo_SetSurfaceCreationMode(mStereoHandle, oldMode))
-			LogInfo("    restore call failed.\n");
-	}
-
-	UnlockResourceCreationMode();
 }
 
 STDMETHODIMP HackerDevice::CreateBuffer(THIS_
@@ -2131,7 +2149,6 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 {
 	D3D11_BUFFER_DESC newDesc;
 	const D3D11_BUFFER_DESC *pNewDesc = NULL;
-	NVAPI_STEREO_SURFACECREATEMODE oldMode;
 
 	LogDebug("HackerDevice::CreateBuffer called\n");
 	if (pDesc)
@@ -2146,10 +2163,12 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 		hash = crc32c_hw(hash, pDesc, sizeof(D3D11_BUFFER_DESC));
 
 	// Override custom settings?
-	pNewDesc = process_texture_override(hash, mStereoHandle, pDesc, &newDesc, &oldMode);
+	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateBuffer(pNewDesc, pInitialData, ppBuffer);
-	restore_old_surface_create_mode(oldMode, mStereoHandle);
+	UnlockResourceCreationMode();
+
 	if (hr == S_OK && ppBuffer && *ppBuffer)
 	{
 		EnterCriticalSectionPretty(&G->mResourcesLock);
@@ -2187,7 +2206,6 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 {
 	D3D11_TEXTURE1D_DESC newDesc;
 	const D3D11_TEXTURE1D_DESC *pNewDesc = NULL;
-	NVAPI_STEREO_SURFACECREATEMODE oldMode;
 	uint32_t data_hash, hash;
 
 	LogDebug("HackerDevice::CreateTexture1D called\n");
@@ -2200,11 +2218,11 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 	LogDebug("  InitialData = %p, hash = %08lx\n", pInitialData, hash);
 
 	// Override custom settings?
-	pNewDesc = process_texture_override(hash, mStereoHandle, pDesc, &newDesc, &oldMode);
+	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateTexture1D(pNewDesc, pInitialData, ppTexture1D);
-
-	restore_old_surface_create_mode(oldMode, mStereoHandle);
+	UnlockResourceCreationMode();
 
 	if (hr == S_OK && ppTexture1D && *ppTexture1D)
 	{
@@ -2261,7 +2279,6 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 {
 	D3D11_TEXTURE2D_DESC newDesc;
 	const D3D11_TEXTURE2D_DESC *pNewDesc = NULL;
-	NVAPI_STEREO_SURFACECREATEMODE oldMode;
 
 	LogDebug("HackerDevice::CreateTexture2D called with parameters\n");
 	if (pDesc)
@@ -2313,11 +2330,13 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 	LogDebug("  InitialData = %p, hash = %08lx\n", pInitialData, hash);
 
 	// Override custom settings?
-	pNewDesc = process_texture_override(hash, mStereoHandle, pDesc, &newDesc, &oldMode);
+	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
 	// Actual creation:
+	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateTexture2D(pNewDesc, pInitialData, ppTexture2D);
-	restore_old_surface_create_mode(oldMode, mStereoHandle);
+	UnlockResourceCreationMode();
+
 	if (ppTexture2D) LogDebug("  returns result = %x, handle = %p\n", hr, *ppTexture2D);
 
 	// Register texture. Every one seen.
@@ -2354,7 +2373,6 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 {
 	D3D11_TEXTURE3D_DESC newDesc;
 	const D3D11_TEXTURE3D_DESC *pNewDesc = NULL;
-	NVAPI_STEREO_SURFACECREATEMODE oldMode;
 
 	LogInfo("HackerDevice::CreateTexture3D called with parameters\n");
 	if (pDesc)
@@ -2384,11 +2402,11 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 	LogInfo("  InitialData = %p, hash = %08lx\n", pInitialData, hash);
 
 	// Override custom settings?
-	pNewDesc = process_texture_override(hash, mStereoHandle, pDesc, &newDesc, &oldMode);
+	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateTexture3D(pNewDesc, pInitialData, ppTexture3D);
-
-	restore_old_surface_create_mode(oldMode, mStereoHandle);
+	UnlockResourceCreationMode();
 
 	// Register texture.
 	if (hr == S_OK && ppTexture3D)
@@ -2538,6 +2556,45 @@ fnv:
 	return hash;
 }
 
+static void CacheShaderBindings(uint64_t hash, const void* pShaderBytecode, SIZE_T BytecodeLength)
+{
+	{
+		CriticalSectionGuard(&G->mShaderBindingsLock);
+
+		if (G->mShaderBindingsCache.find(hash) != G->mShaderBindingsCache.end())
+		{
+			LogDebug("  Skipped parsing %016I64x shader bindings from bytecode (already cached).\n", hash);
+			return;
+		}
+	}
+
+	ShaderBindings bindings{};
+
+	const bool parsed = get_shader_bindings_from_bytecode( pShaderBytecode, BytecodeLength, &bindings);
+
+	{
+		CriticalSectionGuard(&G->mShaderBindingsLock);
+
+		// Another thread may have inserted it while we were parsing.
+		std::pair<std::unordered_map<uint64_t, ShaderBindings>::iterator, bool > result = G->mShaderBindingsCache.emplace(hash, std::move(bindings));
+
+		if (!result.second)
+		{
+			// Another thread won the race.
+			LogDebug("  Shader bindings %016I64x were cached concurrently.\n", hash);
+			return;
+		}
+
+		if (!parsed)
+		{
+			LogInfo("  Failed to parse %016I64x shader bindings from bytecode.\n", hash);
+		}
+		else
+		{
+			LogDebug("  Cached %016I64x shader bindings (parsed from bytecode).\n", hash);
+		}
+	}
+}
 
 // C++ function template of common code shared by all CreateXXXShader functions:
 template <class ID3D11Shader,
@@ -2568,6 +2625,18 @@ STDMETHODIMP HackerDevice::CreateShader(THIS_
 
 	// Calculate hash
 	hash = hash_shader(pShaderBytecode, BytecodeLength);
+
+	//constexpr int iterations = 10000;
+	//auto start = std::chrono::steady_clock::now();
+	//for (int i = 0; i < iterations; ++i)
+	//{
+	CacheShaderBindings(hash, pShaderBytecode, BytecodeLength);
+	//}
+	//auto end = std::chrono::steady_clock::now();
+	//const double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+	//const double avg_ns = total_ms * 1'000'000.0 / iterations;
+	//LogInfo("  CacheShaderBindings: %.2f ns/call (%.2f ms total, %d iterations)\n",
+	//	avg_ns, total_ms, iterations);
 
 	hr = ReplaceShaderFromShaderFixes<ID3D11Shader, OrigCreateShader>
 		(hash, pShaderBytecode, BytecodeLength, pClassLinkage,

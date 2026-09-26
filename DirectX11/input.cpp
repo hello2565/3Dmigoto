@@ -432,7 +432,7 @@ static std::vector<class InputAction *> actions;
 
 void RegisterKeyBinding(LPCWSTR iniKey, const wchar_t *keyName,
 		shared_ptr<InputListener> listener, int auto_repeat, int down_delay,
-		int up_delay)
+		int up_delay, InputDisableScope input_disable_scope)
 {
 	class InputAction *action;
 	class InputButton *button;
@@ -450,7 +450,7 @@ void RegisterKeyBinding(LPCWSTR iniKey, const wchar_t *keyName,
 			try {
 				button = new InputButtonList(keyName);
 			} catch (KeyParseError) {
-				LogOverlayW(LOG_WARNING, L"WARNING: UNABLE TO PARSE KEY BINDING %s=%s\n",
+				LogOverlayW(LOG_WARNING, L"WARNING: UNABLE TO PARSE KEY BINDING %ls=%ls\n",
 						iniKey, keyName);
 				return;
 			}
@@ -464,13 +464,23 @@ void RegisterKeyBinding(LPCWSTR iniKey, const wchar_t *keyName,
 	else
 		action = new InputAction(button, listener);
 
+	if (input_disable_scope == InputDisableScope::INVALID)
+	{
+		if (wcscmp(iniKey, L"toggle_input") == 0)
+			input_disable_scope = InputDisableScope::NONE; // `toggle_input` hotkey cannot be disabled.
+		else
+			input_disable_scope = InputDisableScope::ALL;  // Default to the global disable scope.
+	}
+
+	action->disable_scope = input_disable_scope;
+
 	LogInfoW(L"  %s=%s\n", iniKey, keyName);
 	actions.push_back(action);
 }
 
 bool RegisterIniKeyBinding(LPCWSTR app, LPCWSTR iniKey,
 		InputCallback down_cb, InputCallback up_cb, int auto_repeat,
-		void *private_data)
+		void *private_data, InputDisableScope input_disable_scope)
 {
 	shared_ptr<InputCallbacks> callbacks = make_shared<InputCallbacks>(down_cb, up_cb, private_data);
 	wchar_t keyName[MAX_PATH];
@@ -478,7 +488,7 @@ bool RegisterIniKeyBinding(LPCWSTR app, LPCWSTR iniKey,
 	if (!GetIniString(app, iniKey, 0, keyName, MAX_PATH))
 		return false;
 
-	RegisterKeyBinding(iniKey, keyName, callbacks, auto_repeat, 0, 0);
+	RegisterKeyBinding(iniKey, keyName, callbacks, auto_repeat, 0, 0, input_disable_scope);
 	return true;
 }
 
@@ -529,6 +539,16 @@ void ClearKeyBindings()
 	actions.clear();
 }
 
+static bool IsAdditionalForegroundWindow(HWND hwnd)
+{
+	if (G->additionalForegroundWindowTitle.empty())
+		return false;
+
+	wchar_t title[512] = {};
+	GetWindowTextW(hwnd, title, _countof(title));
+	return wcscmp(title, G->additionalForegroundWindowTitle.c_str()) == 0;
+}
+
 static bool CheckForegroundWindow()
 {
 	DWORD pid;
@@ -536,9 +556,17 @@ static bool CheckForegroundWindow()
 	if (!G->check_foreground_window)
 		return true;
 
-	GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+	HWND hwnd = GetForegroundWindow();
+	if (!hwnd)
+		return false;
 
-	return (pid == GetCurrentProcessId());
+	GetWindowThreadProcessId(hwnd, &pid);
+
+	if (pid == GetCurrentProcessId())
+		return true;
+
+	// Allow additional foreground window matched by title
+	return IsAdditionalForegroundWindow(hwnd);
 }
 
 bool DispatchInputEvents(HackerDevice *device)
@@ -568,6 +596,11 @@ bool DispatchInputEvents(HackerDevice *device)
 
 	for (i = actions.begin(); i != actions.end(); i++) {
 		action = *i;
+
+		if (G->disable_input 
+			&& action->disable_scope >= InputDisableScope::MODS 
+			&& G->input_disable_scope >= action->disable_scope)
+			continue;
 
 		input_processed |= action->Dispatch(device);
 	}

@@ -5,7 +5,9 @@
 #include "IniHandler.h"
 #include "HookedDXGI.h"
 
-#include "nvprofile.h"
+#include <locale>
+#include <chrono>
+#include <thread>
 
 //#include <Shlobj.h>
 //#include <Winuser.h>
@@ -34,6 +36,7 @@ Globals *G = &StaticG;
 
 FILE *LogFile = 0;		// off by default.
 bool gLogDebug = false;
+LogVerbosity gLogVerbosity = LogVerbosity::INVALID;
 
 
 // This critical section must be held to avoid race conditions when creating
@@ -91,11 +94,20 @@ static bool verify_intended_target_late()
 
 static bool InitializeDLL()
 {
-	if (G->gInitialized)
-		return true;
+	// Ensure only one thread performs DLL initialization.
+	{
+		CriticalSectionGuard(&G->mCriticalSection);
+
+		if (G->gInitialized)
+			return true;
+
+		G->gInitialized = true;
+	}
+
+	const char* default_locale = setlocale(LC_CTYPE, nullptr);
+	G->gDefaultLocale = default_locale ? default_locale : "";
 
 	LoadConfigFile();
-
 
 	G->bIntendedTargetExe = verify_intended_target_late();
 	if (!G->bIntendedTargetExe) {
@@ -103,88 +115,18 @@ static bool InitializeDLL()
 		return false;
 	}
 
-	// Preload OUR nvapi before we call init because we need some of our calls.
-#if(_WIN64)
-#define NVAPI_DLL L"nvapi64.dll"
-#else
-#define NVAPI_DLL L"nvapi.dll"
-#endif
-
-	// Load our nvapi wrapper from the same directory as our DLL, for injection cases
-	wchar_t nvapi_path[MAX_PATH];
-	if (GetModuleFileName(migoto_handle, nvapi_path, MAX_PATH)) {
-		wcsrchr(nvapi_path, L'\\')[1] = '\0';
-		wcscat(nvapi_path, NVAPI_DLL);
-		LoadLibrary(nvapi_path);
-	}
-
-	NvAPI_ShortString errorMessage;
-	NvAPI_Status status;
-
-	// Tell our nvapi.dll that it's us calling, and it's OK.
-	NvAPIOverride();
-	status = NvAPI_Initialize();
-	if (status != NVAPI_OK)
-	{
-		NvAPI_GetErrorMessage(status, errorMessage);
-		LogInfo("  NvAPI_Initialize failed: %s\n", errorMessage);
-		return false;
-	}
-
-	log_nv_driver_version();
-	log_check_and_update_nv_profiles();
-
-	// This sequence is to make the force_no_nvapi work.  When the game pCars
-	// starts it calls NvAPI_Initialize that we want to return an error for.
-	// But, the NV stereo driver ALSO calls NvAPI_Initialize, and we need to let
-	// that one go through.  So by calling Stereo_Enable early here, we force
-	// the NV stereo to load and take advantage of the pending NvAPIOverride,
-	// then all subsequent game calls to Initialize will return an error.
-	if (G->gForceNoNvAPI)
-	{
-		NvAPIOverride();
-		status = Profiling::NvAPI_Stereo_Enable();
-		if (status != NVAPI_OK)
-		{
-			NvAPI_GetErrorMessage(status, errorMessage);
-			LogInfo("  NvAPI_Stereo_Enable failed: %s\n", errorMessage);
-			return false;
-		}
-	}
-	//status = CheckStereo();
-	//if (status != NVAPI_OK)
-	//{
-	//	NvAPI_GetErrorMessage(status, errorMessage);
-	//	LogInfo("  *** stereo is disabled: %s  ***\n", errorMessage);
-	//	return false;
-	//}
-
-	// If we are going to use 3D Vision Direct Mode, we need to set the driver 
-	// into that mode early, before any possible CreateDevice occurs.
-	if (G->gForceStereo == 2)
-	{
-		status = NvAPI_Stereo_SetDriverMode(NVAPI_STEREO_DRIVER_MODE_DIRECT);
-		if (status != NVAPI_OK)
-		{
-			NvAPI_GetErrorMessage(status, errorMessage);
-			LogInfo("*** NvAPI_Stereo_SetDriverMode to Direct, failed: %s\n", errorMessage);
-			return false;
-		}
-		LogInfo("  NvAPI_Stereo_SetDriverMode successfully set to Direct Mode\n");
+	if (G->gDllInitializationDelay > 0) {
+		LogInfo("Delaying DLL initialization by %dms...\n", G->gDllInitializationDelay);
+		this_thread::sleep_for(chrono::milliseconds(G->gDllInitializationDelay));
 	}
 
 	LogInfo("\n***  D3D11 DLL successfully initialized.  ***\n\n");
+
 	return true;
 }
 
 void DestroyDLL()
 {
-	if (LogFile)
-	{
-		LogInfo("Destroying DLL...\n");
-		SavePersistentSettings();
-		fclose(LogFile);
-	}
 }
 
 int WINAPI D3DKMTCloseAdapter()
@@ -439,6 +381,7 @@ void InitD311()
 	InitializeCriticalSectionPretty(&G->mCriticalSection);
 	InitializeCriticalSectionPretty(&G->mResourcesLock);
 	InitializeCriticalSectionPretty(&resource_creation_mode_lock);
+	InitializeCriticalSectionPretty(&G->mShaderBindingsLock);
 
 	InitializeDLL();
 	
@@ -1089,69 +1032,6 @@ HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
 	return ret;
 }
 
-// -----------------------------------------------------------------------------------------------
-// We used to call nvapi_QueryInterface directly, however that puts nvapi.dll /
-// nvapi64.dll in our dependencies list and the Windows dynamic linker will
-// refuse to load us if that doesn't exist, which is a problem on AMD or Intel
-// hardware and a problem for some of our users who are interested in 3DMigoto
-// for reasons beyond 3D Vision modding. The way nvapi is supposed to work is
-// that we call functions in the nvapi *static* library and it will try to load
-// the dynamic library, and gracefully fail if it could not, but directly
-// calling nvapi_QueryInterface thwarts that because that call does not come
-// from the static library - it is how the static library calls into the
-// dynamic library.
-//
-// Instead we now load nvapi.dll at runtime in the same way that the static
-// library does, failing gracefully if we could not.
-
-static HMODULE nvDLL;
-static bool nvapi_failed = false;
-typedef NvAPI_Status *(__cdecl *nvapi_QueryInterfaceType)(unsigned int offset);
-static nvapi_QueryInterfaceType nvapi_QueryInterfacePtr;
-
-void NvAPIOverride()
-{
-	static bool warned = false;
-
-	if (nvapi_failed)
-		return;
-
-	if (!nvDLL) {
-		// Use GetModuleHandleEx instead of GetModuleHandle to bump the
-		// refcount on our nvapi wrapper since we are storing a
-		// function pointer from the library. This is important, since
-		// if we aren't running on an nvidia system the nvapi static
-		// library will unload the dynamic library, which would lead to
-		// a crash when we later try to call the NvAPI_QueryInterface
-		// function pointer.
-		GetModuleHandleEx(0, L"nvapi64.dll", &nvDLL);
-		if (!nvDLL) {
-			GetModuleHandleEx(0, L"nvapi.dll", &nvDLL);
-		}
-		if (!nvDLL) {
-			LogInfo("Can't get nvapi handle\n");
-			nvapi_failed = true;
-			return;
-		}
-	}
-	if (!nvapi_QueryInterfacePtr) {
-		nvapi_QueryInterfacePtr = (nvapi_QueryInterfaceType)GetProcAddress(nvDLL, "nvapi_QueryInterface");
-		LogDebug("nvapi_QueryInterfacePtr @ 0x%p\n", nvapi_QueryInterfacePtr);
-		if (!nvapi_QueryInterfacePtr) {
-			LogInfo("Unable to call NvAPI_QueryInterface\n");
-			nvapi_failed = true;
-			return;
-		}
-	}
-
-	// One shot, override custom settings.
-	intptr_t ret = (intptr_t)nvapi_QueryInterfacePtr(0xb03bb03b);
-	if (!warned && (ret & 0xffffffff) != 0xeecc34ab) {
-		LogInfo("  overriding NVAPI wrapper failed.\n");
-		warned = true;
-	}
-}
-
 
 // -----------------------------------------------------------------------------------------------
 // This is our hook for LoadLibraryExW, handling the loading of our original_* libraries.
@@ -1177,9 +1057,9 @@ static HMODULE ReplaceOnMatch(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags
 	wcscat_s(fullPath, MAX_PATH, L"\\");
 	wcscat_s(fullPath, MAX_PATH, library);
 
-	// Bypass the known expected call from our wrapped d3d11 & nvapi, where it needs
+	// Bypass the known expected call from our wrapped d3d11, where it needs
 	// to call to the system to get APIs. This is a bit of a hack, but if the string
-	// comes in as original_d3d11/nvapi/nvapi64, that's from us, and needs to switch
+	// comes in as original_d3d11, that's from us, and needs to switch
 	// to the real one. The test string should have no path attached.
 
 	if (_wcsicmp(lpLibFileName, our_name) == 0)
@@ -1239,13 +1119,10 @@ static HMODULE ReplaceOnMatch(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags
 // There three use cases:
 // x32 game on x32 OS
 //	 LoadLibraryExW("C:\Windows\system32\d3d11.dll", NULL, 0)
-//	 LoadLibraryExW("C:\Windows\system32\nvapi.dll", NULL, 0)
 // x64 game on x64 OS
 //	 LoadLibraryExW("C:\Windows\system32\d3d11.dll", NULL, 0)
-//	 LoadLibraryExW("C:\Windows\system32\nvapi64.dll", NULL, 0)
 // x32 game on x64 OS
 //	 LoadLibraryExW("C:\Windows\SysWOW64\d3d11.dll", NULL, 0)
-//	 LoadLibraryExW("C:\Windows\SysWOW64\nvapi.dll", NULL, 0)
 //
 // To be general and simplify the init, we are going to specifically do the bypass
 // for all variants, even though we only know of this happening on x64 games.
@@ -1293,17 +1170,6 @@ HMODULE __stdcall Hooked_LoadLibraryExW(_In_ LPCWSTR lpLibFileName, _Reserved_ H
 		if (G->load_library_redirect > 1)
 		{
 			module = ReplaceOnMatch(lpLibFileName, hFile, dwFlags, L"original_d3d11.dll", L"d3d11.dll");
-			if (module)
-				return module;
-		}
-
-		if (G->load_library_redirect > 0)
-		{
-			module = ReplaceOnMatch(lpLibFileName, hFile, dwFlags, L"original_nvapi64.dll", L"nvapi64.dll");
-			if (module)
-				return module;
-
-			module = ReplaceOnMatch(lpLibFileName, hFile, dwFlags, L"original_nvapi.dll", L"nvapi.dll");
 			if (module)
 				return module;
 		}

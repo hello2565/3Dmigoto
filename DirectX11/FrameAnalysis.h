@@ -19,7 +19,7 @@ struct FrameAnalysisDeferredDumpBufferArgs {
 	// to override the default copy and/or move constructors and operator=
 	// just to properly handle the refcounting on a raw COM pointer.
 	Microsoft::WRL::ComPtr<ID3D11Buffer> staging;
-	Microsoft::WRL::ComPtr<ID3DBlob> layout;
+	Microsoft::WRL::ComPtr<HackerInputLayout> layout;
 	Microsoft::WRL::ComPtr<ID3D11Buffer> staged_ib_for_vb;
 
 	D3D11_BUFFER_DESC orig_desc;
@@ -37,7 +37,7 @@ struct FrameAnalysisDeferredDumpBufferArgs {
 
 	FrameAnalysisDeferredDumpBufferArgs(FrameAnalysisOptions analyse_options, ID3D11Buffer *staging,
 			D3D11_BUFFER_DESC *orig_desc, wchar_t *filename, FrameAnalysisOptions buf_type_mask, int idx,
-			DXGI_FORMAT ib_fmt, UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+			DXGI_FORMAT ib_fmt, UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 			D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info,
 			ID3D11Buffer *staged_ib_for_vb, UINT ib_off_for_vb) :
 		analyse_options(analyse_options), staging(staging),
@@ -59,15 +59,14 @@ struct FrameAnalysisDeferredDumpTex2DArgs {
 	Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
 
 	wstring filename;
-	bool stereo;
 	D3D11_TEXTURE2D_DESC orig_desc;
 	DXGI_FORMAT format;
 
 	FrameAnalysisDeferredDumpTex2DArgs(FrameAnalysisOptions analyse_options,
 			ID3D11Texture2D *staging, wchar_t *filename,
-			bool stereo, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format) :
+			D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format) :
 		analyse_options(analyse_options), staging(staging),
-		filename(filename), stereo(stereo), orig_desc(*orig_desc), format(format)
+		filename(filename), orig_desc(*orig_desc), format(format)
 	{}
 };
 
@@ -99,6 +98,10 @@ private:
 	void FrameAnalysisLogMiscArray(UINT start, UINT len, void *const *array);
 	void FrameAnalysisLogAsyncQuery(ID3D11Asynchronous *async);
 	void FrameAnalysisLogData(void *buf, UINT size);
+	void FrameAnalysisLogResourceHashInline(ID3D11Resource* resource);
+	void FrameAnalysisLogConstantBuffer(int slot, char* slot_name, ID3D11Resource* resource, UINT first_constant, UINT num_constants);
+	void FrameAnalysisLogConstantBufferArray(UINT start, UINT len, ID3D11Resource* const* ppResources, const UINT* pFirstConstant, const UINT* pNumConstants);
+
 	FILE *frame_analysis_log;
 	unsigned draw_call;
 	unsigned non_draw_call_dump_counter;
@@ -109,25 +112,24 @@ private:
 	ID3D11DeviceContext* GetDumpingContext();
 
 	void Dump2DResource(ID3D11Texture2D *resource, wchar_t *filename,
-			bool stereo, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format);
+			D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format);
 	bool DeferDump2DResource(ID3D11Texture2D *staging, wchar_t *filename,
-			bool stereo, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format);
+			D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format);
 	void Dump2DResourceImmediateCtx(ID3D11Texture2D *staging, wstring filename,
-			bool stereo, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format);
+			D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format);
 
 	HRESULT ResolveMSAA(ID3D11Texture2D *src, D3D11_TEXTURE2D_DESC *srcDesc,
 			ID3D11Texture2D **resolved, DXGI_FORMAT format);
 	HRESULT StageResource(ID3D11Texture2D *src,
 			D3D11_TEXTURE2D_DESC *srcDesc, ID3D11Texture2D **dst, DXGI_FORMAT format);
 	HRESULT CreateStagingResource(ID3D11Texture2D **resource,
-		D3D11_TEXTURE2D_DESC desc, bool stereo, bool msaa, DXGI_FORMAT format);
+		D3D11_TEXTURE2D_DESC desc, bool msaa, DXGI_FORMAT format);
 
-	void DumpStereoResource(ID3D11Texture2D *resource, wchar_t *filename, DXGI_FORMAT format);
 	void DumpBufferTxt(wchar_t *filename, D3D11_MAPPED_SUBRESOURCE *map,
 			UINT size, char type, int idx, UINT stride, UINT offset);
 	void DumpVBTxt(wchar_t *filename, D3D11_MAPPED_SUBRESOURCE *map,
 			UINT size, int idx, UINT stride, UINT offset,
-			UINT first, UINT count, ID3DBlob *layout,
+			UINT first, UINT count, HackerInputLayout *layout,
 			D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info);
 	void DumpIBTxt(wchar_t *filename, D3D11_MAPPED_SUBRESOURCE *map,
 			UINT size, DXGI_FORMAT ib_fmt, UINT offset,
@@ -135,19 +137,19 @@ private:
 
 	void DumpBuffer(ID3D11Buffer *buffer, wchar_t *filename,
 			FrameAnalysisOptions buf_type_mask, int idx, DXGI_FORMAT ib_fmt,
-			UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+			UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 			D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info,
 			ID3D11Buffer **staged_ib_ret, ID3D11Buffer *staged_ib_for_vb, UINT ib_off_for_vb);
 	bool DeferDumpBuffer(ID3D11Buffer *staging,
 			D3D11_BUFFER_DESC *orig_desc, wchar_t *filename,
 			FrameAnalysisOptions buf_type_mask, int idx, DXGI_FORMAT ib_fmt,
-			UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+			UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 			D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info,
 			ID3D11Buffer *staged_ib_for_vb, UINT ib_off_for_vb);
 	void DumpBufferImmediateCtx(ID3D11Buffer *staging, D3D11_BUFFER_DESC *orig_desc,
 			wstring filename, FrameAnalysisOptions buf_type_mask,
 			int idx, DXGI_FORMAT ib_fmt, UINT stride, UINT offset,
-			UINT first, UINT count, ID3DBlob *layout,
+			UINT first, UINT count, HackerInputLayout *layout,
 			D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info,
 			ID3D11Buffer *staged_ib_for_vb, UINT ib_off_for_vb);
 
@@ -173,7 +175,7 @@ private:
 	void finish_deferred_resources(ID3D11CommandList *command_list);
 
 	HRESULT FrameAnalysisFilename(wchar_t *filename, size_t size, bool compute,
-			wchar_t *reg, char shader_type, int idx, ID3D11Resource *handle);
+			wchar_t *reg, char shader_type, int idx, ID3D11Resource *handle, uint32_t override_hash = 0);
 	HRESULT FrameAnalysisFilenameResource(wchar_t *filename, size_t size, const wchar_t *type,
 			ID3D11Resource *handle, bool force_filename_handle);
 	const wchar_t* dedupe_tex2d_filename(ID3D11Texture2D *resource,
@@ -188,7 +190,7 @@ private:
 			UINT stride, UINT offset);
 	void dedupe_buf_filename_vb_txt(const wchar_t *bin_filename,
 			wchar_t *txt_filename, size_t size, int idx,
-			UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+			UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 			D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info);
 	void dedupe_buf_filename_ib_txt(const wchar_t *bin_filename,
 			wchar_t *txt_filename, size_t size, DXGI_FORMAT ib_fmt,
@@ -209,7 +211,6 @@ private:
 			FrameAnalysisOptions type_mask, wchar_t *type);
 	void FrameAnalysisAfterUnmap(ID3D11Resource *pResource);
 	void FrameAnalysisAfterUpdate(ID3D11Resource *pResource);
-	void update_stereo_dumping_mode();
 	void set_default_dump_formats(bool draw);
 
 	FrameAnalysisOptions analyse_options;
@@ -222,7 +223,9 @@ public:
 
 	// public to allow CommandList access
 	void FrameAnalysisLog(char *fmt, ...) override;
+	void FrameAnalysisLogW(wchar_t* fmt, ...);
 	void vFrameAnalysisLog(char *fmt, va_list ap);
+	void vFrameAnalysisLogW(wchar_t* fmt, va_list ap);
 	// An alias for the above function that we use to denote that omitting
 	// the newline was done intentionally. For now this is just for our
 	// reference, but later we might actually make the default function

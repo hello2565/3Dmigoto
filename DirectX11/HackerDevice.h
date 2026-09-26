@@ -5,7 +5,6 @@
 #include <d3d11_1.h>
 #include <INITGUID.h>
 
-#include "nvstereo.h"
 #include "HackerContext.h"
 #include "HackerDXGI.h"
 
@@ -53,6 +52,7 @@ private:
 
 	HackerContext *mHackerContext;
 	HackerSwapChain *mHackerSwapChain;
+	std::unordered_map<uint64_t, HackerInputLayout*> mInputLayoutCache;
 
 	// Utility routines
 	char *_ReplaceShaderFromShaderFixes(UINT64 hash, const wchar_t *shaderType, const void *pShaderBytecode,
@@ -91,9 +91,7 @@ private:
 	void KeepOriginalShader(UINT64 hash, wchar_t *shaderType, ID3D11Shader *pShader,
 		const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage);
 
-	HRESULT CreateStereoParamResources();
 	void CreatePinkHuntingResources();
-	HRESULT SetGlobalNVSurfaceCreationMode();
 
 	// Templates of nearly identical functions
 	template <class ID3D11Shader,
@@ -114,11 +112,11 @@ private:
 		__out_opt  ID3D11Shader **ppShader,
 		wchar_t *shaderType);
 
+	HackerInputLayout* FindCachedInputLayout(uint64_t hash);
+	void CacheInputLayout(uint64_t hash, HackerInputLayout* layout);
+	void ClearInputLayoutCache();
+
 public:
-	StereoHandle mStereoHandle;
-	nv::stereo::ParamTextureManagerD3D11 mParamTextureManager;
-	ID3D11Texture2D *mStereoTexture;
-	ID3D11ShaderResourceView *mStereoResourceView;
 	ID3D11ShaderResourceView *mZBufferResourceView;
 	ID3D11Texture1D *mIniTexture;
 	ID3D11ShaderResourceView *mIniResourceView;
@@ -228,6 +226,26 @@ public:
 		_In_  SIZE_T BytecodeLength,
 		/* [annotation] */
 		_Out_opt_  ID3D11InputLayout **ppInputLayout);
+
+	HRESULT HackerDevice::CreateInputLayoutInternal(
+		const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs,
+		UINT NumElements,
+		const void* pShaderBytecodeWithInputSignature,
+		SIZE_T BytecodeLength,
+		uint64_t hash,
+		HackerInputLayout** ppLayout);
+
+	HRESULT STDMETHODCALLTYPE CreateCustomInputLayout(
+		/* [annotation] */
+		_In_reads_(NumElements)  const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs,
+		/* [annotation] */
+		_In_range_(0, D3D11_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT)  UINT NumElements,
+		/* [annotation] */
+		_In_  const void* pShaderBytecodeWithInputSignature,
+		/* [annotation] */
+		_In_  SIZE_T BytecodeLength,
+		/* [annotation] */
+		_Out_opt_  ID3D11InputLayout** ppInputLayout);
 
 	HRESULT STDMETHODCALLTYPE CreateVertexShader(
 		/* [annotation] */

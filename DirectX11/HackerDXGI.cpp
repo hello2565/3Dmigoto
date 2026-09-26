@@ -189,38 +189,6 @@ IDXGISwapChain1* HackerSwapChain::GetOrigSwapChain1()
 }
 
 
-// -----------------------------------------------------------------------------
-
-void HackerSwapChain::UpdateStereoParams()
-{
-	if (G->ENABLE_TUNE)
-	{
-		//device->mParamTextureManager.mSeparationModifier = gTuneValue;
-		mHackerDevice->mParamTextureManager.mTuneVariable1 = G->gTuneValue[0];
-		mHackerDevice->mParamTextureManager.mTuneVariable2 = G->gTuneValue[1];
-		mHackerDevice->mParamTextureManager.mTuneVariable3 = G->gTuneValue[2];
-		mHackerDevice->mParamTextureManager.mTuneVariable4 = G->gTuneValue[3];
-		int counter = 0;
-		if (counter-- < 0)
-		{
-			counter = 30;
-			mHackerDevice->mParamTextureManager.mForceUpdate = true;
-		}
-	}
-
-	// Update stereo parameter texture. It's possible to arrive here with no texture available though,
-	// so we need to check first.
-	if (mHackerDevice->mStereoTexture)
-	{
-		LogDebug("  updating stereo parameter texture.\n");
-		mHackerDevice->mParamTextureManager.UpdateStereoTexture(mHackerDevice, mHackerContext, mHackerDevice->mStereoTexture, false);
-	}
-	else
-	{
-		LogDebug("  stereo parameter texture missing.\n");
-	}
-}
-
 // Called at each DXGI::Present() to give us reliable time to execute user
 // input and hunting commands.
 
@@ -231,6 +199,15 @@ void HackerSwapChain::RunFrameActions()
 	// Regardless of log settings, since this runs every frame, let's flush the log
 	// so that the most lost will be one frame worth.  Tradeoff of performance to accuracy
 	if (LogFile) fflush(LogFile);
+
+	uint64_t system_tick_count = GetSystemTicks();
+
+	G->gFrameTime = (system_tick_count - G->gSystemTickCount) / 1'000'000.0f;
+	G->gTime = (system_tick_count - G->ticks_at_launch) / 1'000'000.0f;
+
+	G->gSystemTickCount = system_tick_count;
+
+	G->gFPSCounter.Update(system_tick_count);
 
 	// Run the command list here, before drawing the overlay so that a
 	// custom shader on the present call won't remove the overlay. Also,
@@ -253,7 +230,7 @@ void HackerSwapChain::RunFrameActions()
 			G->analyse_frame = false;
 			if (G->DumpUsage)
 				DumpUsage(G->ANALYSIS_PATH);
-			LogOverlay(LOG_INFO, "Frame analysis saved to %S\n", G->ANALYSIS_PATH);
+			LogOverlayW(LOG_INFO, L"Frame analysis saved to %ls\n", G->ANALYSIS_PATH);
 		}
 	}
 
@@ -275,6 +252,24 @@ void HackerSwapChain::RunFrameActions()
 	if (G->gReloadConfigPending)
 		ReloadConfig(mHackerDevice);
 
+	// Regular LoadConfigFile() on startup fails to properly load all resources in some edge cases 
+	// So, as bandaid solution, it has some sense to force ReloadConfig() after DLL is fully initialized
+	// This way resources will be loaded properly before modded object appear on screen and cause crash
+	if (G->gConfigInitialized) {
+		// Autosave persistent variables every gSettingsAutoSaveInterval seconds
+		if (G->gTime - G->gSettingsSaveTime > G->gSettingsAutoSaveInterval) {
+			if (SavePersistentSettings())
+				SaveUnknownPersistentSettings();
+			//LogOverlay(LOG_INFO, "Saved Persistent Variables\n");
+		}
+	}
+	else {
+		if (G->gTime > G->gConfigInitializationDelay) {
+			G->gConfigInitialized = true;
+			ReloadConfig(mHackerDevice);
+		}
+	}
+
 	// Draw the on-screen overlay text with hunting and informational
 	// messages, before final Present. We now do this after the shader and
 	// config reloads, so if they have any notices we will see them this
@@ -289,6 +284,7 @@ void HackerSwapChain::RunFrameActions()
 	// moment, but let's do it last, because logically it makes sense to be
 	// incremented when we call the original present call:
 	G->frame_no++;
+	mHackerContext->ResetCallCounters();
 
 	// When not hunting most keybindings won't have been registered, but
 	// still skip the below logic that only applies while hunting.
@@ -360,15 +356,17 @@ STDMETHODIMP HackerSwapChain::QueryInterface(THIS_
 
 	if (riid == __uuidof(IDXGISwapChain2))
 	{
-		LogInfo("***  returns E_NOINTERFACE as error for IDXGISwapChain2.\n");
-		*ppvObject = NULL;
-		return E_NOINTERFACE;
+		// Return interface without wrapper to support Endfield's pipeline.
+		LogInfo("  return IDXGISwapChain2 interface (%p) without wrapper.\n", ppvObject);
+		LogInfo("  returns result = %x for %p\n", hr, ppvObject);
+		return hr;
 	}
 	if (riid == __uuidof(IDXGISwapChain3))
 	{
-		LogInfo("***  returns E_NOINTERFACE as error for IDXGISwapChain3.\n");
-		*ppvObject = NULL;
-		return E_NOINTERFACE;
+		// Return interface without wrapper to support HDR color space setup.
+		LogInfo("  return IDXGISwapChain3 interface (%p) without wrapper.\n", ppvObject);
+		LogInfo("  returns result = %x for %p\n", hr, ppvObject);
+		return hr;
 	}
 	if (riid == __uuidof(IDXGISwapChain4))
 	{
@@ -556,6 +554,30 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 		if (profiling)
 			Profiling::start(&profiling_state);
 
+		if (G->hunting == HUNTING_MODE_ENABLED) {
+			if (G->overlay_buffer_hash_lifetime >= 0)
+				PurgeStaleVisitedBufferHashes(mHackerDevice);
+			if (G->mSelectedIndexBufferPos == INT_MAX) {
+				G->mSelectedIndexBufferPos = G->mVisitedIndexBuffers.size() - 1;
+				G->mSelectedIndexBuffer = *std::prev(G->mVisitedIndexBuffers.end());
+			}
+			if (G->mSelectedVertexBufferPos == INT_MAX) {
+				G->mSelectedVertexBufferPos = G->mVisitedVertexBuffers.size() - 1;
+				G->mSelectedVertexBuffer = *std::prev(G->mVisitedVertexBuffers.end());
+			}
+			if (G->gResetSelectedVertexBufferSlotId) {
+				if (!G->mVisitedVertexBuffers.empty()) {
+					G->mSelectedVertexBuffer = *G->mVisitedVertexBuffers.begin();
+					G->mSelectedVertexBufferPos = 0;
+					G->gResetSelectedVertexBufferSlotId = false;
+				}
+			}
+		}
+
+		if (G->track_region_hashes) {
+			ClearRegionHashesGlobalCache();
+		}
+
 		// Every presented frame, we want to take some CPU time to run our actions,
 		// which enables hunting, and snapshots, and aiming overrides and other inputs
 		RunFrameActions();
@@ -571,10 +593,6 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 	if (!(Flags & DXGI_PRESENT_TEST)) {
 		if (profiling)
 			Profiling::start(&profiling_state);
-
-		// Update the stereo params texture just after the present so that 
-		// shaders get the new values for the current frame:
-		UpdateStereoParams();
 
 		G->bb_is_upscaling_bb = !!G->SCREEN_UPSCALING && G->upscaling_command_list_using_explicit_bb_flip;
 
@@ -878,10 +896,6 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
 		if (profiling)
 			Profiling::start(&profiling_state);
-
-		// Update the stereo params texture just after the present so that we
-		// get the new values for the current frame:
-		UpdateStereoParams();
 
 		G->bb_is_upscaling_bb = !!G->SCREEN_UPSCALING && G->upscaling_command_list_using_explicit_bb_flip;
 

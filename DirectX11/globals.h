@@ -15,11 +15,20 @@
 #include "DecompileHLSL.h"
 
 #include "ResourceHash.h"
+#include "ShaderRegex.h"
 #include "CommandList.h"
 #include "profiling.h"
 #include "lock.h"
 
 extern HINSTANCE migoto_handle;
+
+static EnumName_t<const wchar_t*, LogVerbosity> LogVerbosityNames[] = {
+	{L"disabled", LogVerbosity::DISABLED},
+	{L"warning",  LogVerbosity::WARNING},
+	{L"info",     LogVerbosity::INFO},
+	{L"debug",    LogVerbosity::DEBUG},
+	{NULL,        LogVerbosity::INVALID} // End of list marker
+};
 
 // Resolve circular include dependency between Globals.h ->
 // CommandList.h -> HackerContext.h -> Globals.h
@@ -57,7 +66,6 @@ enum class MarkingAction {
 	REGEX      = 0x0000008,
 	DUMP_MASK  = 0x000000e, // HLSL, Assembly and/or ShaderRegex is selected
 	MONO_SS    = 0x0000010,
-	STEREO_SS  = 0x0000020,
 	SS_IF_PINK = 0x0000040,
 
 	DEFAULT    = 0x0000003,
@@ -71,7 +79,6 @@ static EnumName_t<const wchar_t *, MarkingAction> MarkingActionNames[] = {
 	{L"ShaderRegex", MarkingAction::REGEX},
 	{L"clipboard", MarkingAction::CLIPBOARD},
 	{L"mono_snapshot", MarkingAction::MONO_SS},
-	{L"stereo_snapshot", MarkingAction::STEREO_SS},
 	{L"snapshot_if_pink", MarkingAction::SS_IF_PINK},
 	{NULL, MarkingAction::INVALID} // End of list marker
 };
@@ -174,7 +181,6 @@ enum class FrameAnalysisOptions {
 	FILENAME_REG    = 0x00002000,
 	FILENAME_HANDLE = 0x00004000,
 	PERSIST         = 0x00008000, // Used by shader/texture triggers
-	STEREO          = 0x00010000,
 	MONO            = 0x00020000,
 	STEREO_MASK     = 0x00030000,
 	HOLD            = 0x00040000,
@@ -215,7 +221,6 @@ static EnumName_t<wchar_t *, FrameAnalysisOptions> FrameAnalysisOptionNames[] = 
 	// Misc options:
 	{L"clear_rt", FrameAnalysisOptions::CLEAR_RT},
 	{L"persist", FrameAnalysisOptions::PERSIST},
-	{L"stereo", FrameAnalysisOptions::STEREO},
 	{L"mono", FrameAnalysisOptions::MONO},
 	{L"filename_reg", FrameAnalysisOptions::FILENAME_REG},
 	{L"filename_handle", FrameAnalysisOptions::FILENAME_HANDLE},
@@ -258,7 +263,6 @@ static EnumName_t<const wchar_t *, DepthBufferFilter> DepthBufferFilterNames[] =
 struct ShaderOverride {
 	std::wstring first_ini_section;
 	DepthBufferFilter depth_filter;
-	UINT64 partner_hash;
 	char model[20]; // More than long enough for even ps_4_0_level_9_0
 	int allow_duplicate_hashes;
 	float filter_index, backup_filter_index;
@@ -268,7 +272,6 @@ struct ShaderOverride {
 
 	ShaderOverride() :
 		depth_filter(DepthBufferFilter::NONE),
-		partner_hash(0),
 		allow_duplicate_hashes(1),
 		filter_index(FLT_MAX),
 		backup_filter_index(FLT_MAX)
@@ -280,12 +283,13 @@ typedef std::unordered_map<UINT64, struct ShaderOverride> ShaderOverrideMap;
 
 struct TextureOverride {
 	std::wstring ini_section;
-	int stereoMode;
 	int format;
 	int width;
 	int height;
 	float width_multiply;
 	float height_multiply;
+	int override_byte_width;
+	int override_num_elements;
 	std::vector<int> iterations;
 	bool expand_region_copy;
 	bool deny_cpu_read;
@@ -306,12 +310,13 @@ struct TextureOverride {
 	CommandList post_command_list;
 
 	TextureOverride() :
-		stereoMode(-1),
 		format(-1),
 		width(-1),
 		height(-1),
 		width_multiply(1.0),
 		height_multiply(1.0),
+		override_byte_width(-1),
+		override_num_elements(-1),
 		expand_region_copy(false),
 		deny_cpu_read(false),
 		filter_index(FLT_MAX),
@@ -395,15 +400,48 @@ enum class AsyncQueryType
 	COUNTER,
 };
 
+struct ShaderModelCacheEntry {
+	std::string shaderModel;
+};
+
+enum class InputDisableScope: int8_t {
+	INVALID = -1,
+	NONE    = 0,
+	MODS    = 1,
+	ALL     = 2,
+};
+static EnumName_t<const wchar_t*, InputDisableScope> InputDisableScopeNames[] = {
+	{L"mods", InputDisableScope::MODS},
+	{L"all", InputDisableScope::ALL},
+
+	{NULL, InputDisableScope::INVALID} // End of list marker
+};
+
 struct Globals
 {
 	bool gInitialized;
+	std::string gDefaultLocale;
 	bool bIntendedTargetExe;
 	bool gReloadConfigPending;
+	bool gConfigInitialized;
 	bool gWipeUserConfig;
-	bool gLogInput;
+	bool gShowWarnings;
 	bool dump_all_profiles;
-	DWORD ticks_at_launch;
+
+	bool clear_unknown_settings = true;
+	uint32_t current_unknown_settings_hash = 0;
+	uint32_t last_unknown_settings_hash = 0;
+
+	uint64_t ticks_at_launch;
+	uint64_t gSystemTickCount;
+	float gTime;
+	float gFrameTime;
+	float gSettingsSaveTime;
+
+	FPSCounter gFPSCounter{ 0.1f, 1.0f };
+
+	std::wstring additionalForegroundWindowTitle;
+	const std::wstring gDefaultNamespace = L"d3dx.ini";
 
 	wchar_t SHADER_PATH[MAX_PATH];
 	wchar_t SHADER_CACHE_PATH[MAX_PATH];
@@ -411,7 +449,7 @@ struct Globals
 	int load_library_redirect;
 
 	std::wstring user_config;
-	int user_config_dirty;
+	bool user_config_dirty;
 
 	EnableHooks enable_hooks;
 	
@@ -436,13 +474,9 @@ struct Globals
 
 	MarkingMode marking_mode;
 	MarkingAction marking_actions;
-	int gForceStereo;
-	bool gCreateStereoProfile;
-	int gSurfaceCreateMode;
-	int gSurfaceSquareCreateMode;
-	bool gForceNoNvAPI;
 
 	UINT hunting;
+	int overlay_buffer_hash_lifetime;
 	bool fix_enabled;
 	bool config_reloadable;
 	bool show_original_enabled;
@@ -460,6 +494,9 @@ struct Globals
 	std::unordered_set<void*> frame_analysis_seen_rts;
 
 	ShaderHashType shader_hash_type;
+	bool track_region_hashes;
+	bool track_implicit_index_buffers;
+	bool allow_buffer_resize;
 	int texture_hash_version;
 	int EXPORT_HLSL;		// 0=off, 1=HLSL only, 2=HLSL+OriginalASM, 3= HLSL+OriginalASM+recompiledASM
 	bool EXPORT_SHADERS, EXPORT_FIXED, EXPORT_BINARY, CACHE_SHADERS, SCISSOR_DISABLE;
@@ -476,7 +513,6 @@ struct Globals
 
 	std::vector<DirectX::XMFLOAT4> iniParams;
 	int iniParamsReserved;
-	int StereoParamsReg;
 	int IniParamsReg;
 
 	ResolutionInfo mResolutionInfo;
@@ -498,19 +534,38 @@ struct Globals
 	bool hide_cursor;
 	bool cursor_upscaling_bypass;
 	bool check_foreground_window;
+	InputDisableScope input_disable_scope;
+	bool disable_input;
+	int gDllInitializationDelay;
+	int gSettingsAutoSaveInterval;
+	int gConfigInitializationDelay;
+	bool gSkipEarlyIncludesLoad;
+	int gFallbackScreenWidth;
+	int gFallbackScreenHeight;
+	bool gForceDetectColorSpace;
 
 	CRITICAL_SECTION mCriticalSection;
 
-	std::set<uint32_t> mVisitedIndexBuffers;				// std::set is sorted for consistent order while hunting
+	std::set<uint32_t> gVisitedVertexBufferSlotIds;
+	INT gSelectedVertexBufferSlotId;
+	bool gResetSelectedVertexBufferSlotId;
+	DrawCallInfo gSelectedIndexBufferDrawInfo;
+	DrawCallInfo gSelectedVertexBufferDrawInfo;
+
+	float mVisitedBuffersLastPurgeTime;
+	std::unordered_map<uint32_t, unsigned> mVisitedIndexBuffersLastSeenFrame;
+	std::unordered_map<uint32_t, unsigned> mVisitedVertexBuffersLastSeenFrame;
+
+	std::set<uint32_t> mVisitedIndexBuffers;		        // std::set is sorted for consistent order while hunting
 	uint32_t mSelectedIndexBuffer;
 	int mSelectedIndexBufferPos;
 	std::set<UINT64> mSelectedIndexBuffer_VertexShader;		// std::set so that shaders used with an index buffer will be sorted in log when marked
 	std::set<UINT64> mSelectedIndexBuffer_PixelShader;		// std::set so that shaders used with an index buffer will be sorted in log when marked
 
-	std::set<uint32_t> mVisitedVertexBuffers;				// std::set is sorted for consistent order while hunting
+	std::set<uint32_t> mVisitedVertexBuffers;		        // std::set is sorted for consistent order while hunting
 	uint32_t mSelectedVertexBuffer;
 	int mSelectedVertexBufferPos;
-	std::set<UINT64> mSelectedVertexBuffer_VertexShader;		// std::set so that shaders used with an index buffer will be sorted in log when marked
+	std::set<UINT64> mSelectedVertexBuffer_VertexShader;	// std::set so that shaders used with an index buffer will be sorted in log when marked
 	std::set<UINT64> mSelectedVertexBuffer_PixelShader;		// std::set so that shaders used with an index buffer will be sorted in log when marked
 
 	std::set<UINT64> mVisitedVertexShaders;					// Only shaders seen since last hunting timeout; std::set for consistent order while hunting
@@ -549,6 +604,14 @@ struct Globals
 	ShaderOverrideMap mShaderOverrideMap;
 	TextureOverrideMap mTextureOverrideMap;
 	FuzzyTextureOverrides mFuzzyTextureOverrides;
+
+	std::unordered_map<UINT64, ShaderModelCacheEntry> mShaderModelCache;
+
+	CRITICAL_SECTION mShaderBindingsLock;
+	std::unordered_map<UINT64, ShaderBindings> mShaderBindingsCache;
+
+	unordered_map<uint32_t, TextureOverrideFuzzyMatches> mTextureOverrideDrawIndexMap;  // Contains hash+TextureOverrides pairs indexed by match_index_count
+	unordered_map<uint32_t, TextureOverrideFuzzyMatches> mTextureOverrideDrawVertexMap; // Contains hash+TextureOverrides pairs indexed by match_vertex_count
 
 	// Statistics
 	///////////////////////////////////////////////////////////////////////
@@ -626,12 +689,15 @@ struct Globals
 		mPinkingShader(0),
 
 		hunting(HUNTING_MODE_DISABLED),
+		overlay_buffer_hash_lifetime(-1),
 		fix_enabled(true),
 		config_reloadable(false),
 		show_original_enabled(false),
 		huntTime(0),
 		verbose_overlay(false),
 		suppress_overlay(false),
+		gSelectedVertexBufferSlotId(-1),
+		gResetSelectedVertexBufferSlotId(false),
 
 		deferred_contexts_enabled(true),
 
@@ -642,6 +708,9 @@ struct Globals
 		cur_analyse_options(FrameAnalysisOptions::INVALID),
 
 		shader_hash_type(ShaderHashType::FNV),
+		track_region_hashes(false),
+		track_implicit_index_buffers(false),
+		allow_buffer_resize(true),
 		texture_hash_version(0),
 		EXPORT_SHADERS(false),
 		EXPORT_HLSL(0),
@@ -660,6 +729,8 @@ struct Globals
 		hide_cursor(false),
 		cursor_upscaling_bypass(true),
 		check_foreground_window(false),
+		disable_input(false),
+		input_disable_scope(InputDisableScope::INVALID),
 
 		GAME_INTERNAL_WIDTH(1), // it gonna be used by mouse pos hook in case of softwaremouse is on and it can be called before
 		GAME_INTERNAL_HEIGHT(1),//  the swap chain is created and the proper data set to avoid errors in the hooked winapi functions
@@ -675,11 +746,6 @@ struct Globals
 
 		marking_mode(MarkingMode::INVALID),
 		marking_actions(MarkingAction::INVALID),
-		gForceStereo(0),
-		gCreateStereoProfile(false),
-		gSurfaceCreateMode(-1),
-		gSurfaceSquareCreateMode(-1),
-		gForceNoNvAPI(false),
 		ZBufferHashToInject(0),
 		SCISSOR_DISABLE(0),
 
@@ -691,10 +757,21 @@ struct Globals
 		gInitialized(false),
 		bIntendedTargetExe(false),
 		gReloadConfigPending(false),
+		gConfigInitialized(false),
 		gWipeUserConfig(false),
-		user_config_dirty(0),
-		gLogInput(false),
-		dump_all_profiles(false)
+		user_config_dirty(false),
+		gShowWarnings(true),
+		gDllInitializationDelay(0),
+		gSettingsAutoSaveInterval(0),
+		gConfigInitializationDelay(0),
+		gSkipEarlyIncludesLoad(true),
+		gFallbackScreenWidth(0),
+		gFallbackScreenHeight(0),
+		gForceDetectColorSpace(false),
+		dump_all_profiles(false),
+		gSystemTickCount(0),
+		gTime(0),
+		gFrameTime(0)
 	{
 		int i;
 
@@ -710,7 +787,7 @@ struct Globals
 		for (i = 0; i < 11; i++)
 			FILTER_REFRESH[i] = 0;
 
-		ticks_at_launch = GetTickCount();
+		ticks_at_launch = GetSystemTicks();
 	}
 };
 
@@ -745,23 +822,46 @@ struct TLS
 
 	LockStack locks_held;
 
+	bool com_initialized;
+
 	TLS() :
-		hooking_quirk_protection(false)
+		hooking_quirk_protection(false),
+		com_initialized(false)
 	{}
 };
 
 extern DWORD tls_idx;
 static struct TLS* get_tls()
 {
-	TLS *tls;
+	TLS* tls = (TLS*)TlsGetValue(tls_idx);
 
-	tls = (TLS*)TlsGetValue(tls_idx);
-	if (!tls) {
+	if (!tls)
+	{
 		tls = new TLS();
 		TlsSetValue(tls_idx, tls);
 	}
 
 	return tls;
+}
+
+inline bool EnsureCOM()
+{
+	TLS* tls = get_tls();
+
+	if (tls->com_initialized)
+		return true;
+
+	HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+	if (hr == RPC_E_CHANGED_MODE)
+		return true;
+
+	if (FAILED(hr))
+		return false;
+
+	tls->com_initialized = (hr == S_OK);
+
+	return true;
 }
 
 extern Globals *G;

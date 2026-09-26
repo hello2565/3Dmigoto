@@ -3,7 +3,6 @@
 
 #include "Overlay.h"
 
-#include <stdexcept>
 #include <DirectXColors.h>
 //#include <StrSafe.h>
 
@@ -13,12 +12,13 @@
 #include "log.h"
 #include "version.h"
 #include "D3D11Wrapper.h"
-//#include "nvapi.h"
 #include "Globals.h"
 #include "profiling.h"
 
 #include "HackerDevice.h"
 #include "HackerContext.h"
+
+#include <stdexcept>
 
 #define MAX_SIMULTANEOUS_NOTICES 10
 
@@ -53,8 +53,8 @@ struct LogLevelParams log_levels[] = {
 	{ DirectX::Colors::Red,       20000, false, &Overlay::mFontNotifications }, // DIRE
 	{ DirectX::Colors::OrangeRed, 10000, false, &Overlay::mFontNotifications }, // WARNING
 	{ DirectX::Colors::OrangeRed, 10000, false, &Overlay::mFontProfiling     }, // WARNING_MONOSPACE
-	{ DirectX::Colors::Orange,     5000,  true, &Overlay::mFontNotifications }, // NOTICE
-	{ DirectX::Colors::LimeGreen,  2000,  true, &Overlay::mFontNotifications }, // INFO
+	{ DirectX::Colors::Orange,     5000, false, &Overlay::mFontNotifications }, // NOTICE
+	{ DirectX::Colors::LimeGreen,  2000, false, &Overlay::mFontNotifications }, // INFO
 };
 
 // Side note: Not really stoked with C++ string handling.  There are like 4 or
@@ -84,8 +84,6 @@ Overlay::Overlay(HackerDevice *pDevice, HackerContext *pContext, IDXGISwapChain 
 	// Drawing environment for this swap chain. This is the game environment.
 	// These should specifically avoid Hacker* objects, to avoid object
 	// callbacks or other problems. We just want to draw here, nothing tricky.
-	// The only exception being that we need the HackerDevice in order to
-	// draw the current stereoparams.
 	mHackerDevice = pDevice;
 	mHackerContext = pContext;
 	mOrigSwapChain = pSwapChain;
@@ -201,9 +199,8 @@ using namespace DirectX::SimpleMath;
 // Notes:
 	//1) Active PS location(probably x / N format)
 	//2) Active VS location(x / N format)
-	//3) Current convergence and separation. (convergence, a must)
-	//4) Error state of reload(syntax errors go red or something)
-	//5) Duplicate Mark(maybe yellow text for location, red if Decompile failed)
+	//3) Error state of reload(syntax errors go red or something)
+	//4) Duplicate Mark(maybe yellow text for location, red if Decompile failed)
 
 	//Maybe:
 	//5) Other state, like show_original active.
@@ -544,12 +541,15 @@ void Overlay::DrawOutlinedString(DirectX::SpriteFont *font, wchar_t const *text,
 
 static void AppendShaderText(wchar_t *fullLine, wchar_t *type, int pos, size_t size)
 {
-	if (size == 0)
+	bool vb = type && type[0] == L'V' && type[1] == L'B';
+	if (size == 0 && (!vb))
 		return;
 
 	// The position is zero based, so we'll make it +1 for the humans.
-	if (++pos == 0)
+	if (size != 0 && ++pos == 0)
 		size = 0;
+	else if (pos < 0)
+		pos = 0;
 
 	// Format: "VS:1/15"
 	wchar_t append[maxstring];
@@ -565,8 +565,6 @@ static void AppendShaderText(wchar_t *fullLine, wchar_t *type, int pos, size_t s
 
 static void CreateShaderCountString(wchar_t *counts)
 {
-	const wchar_t *marking_mode;
-
 	wcscpy_s(counts, maxstring, L"");
 	// The order here more or less follows how important these are for
 	// shaderhacking. VS and PS are the absolute most important, CS is
@@ -578,16 +576,15 @@ static void CreateShaderCountString(wchar_t *counts)
 	AppendShaderText(counts, L"GS", G->mSelectedGeometryShaderPos, G->mVisitedGeometryShaders.size());
 	AppendShaderText(counts, L"DS", G->mSelectedDomainShaderPos, G->mVisitedDomainShaders.size());
 	AppendShaderText(counts, L"HS", G->mSelectedHullShaderPos, G->mVisitedHullShaders.size());
-	if (G->mSelectedVertexBuffer != -1)
-		AppendShaderText(counts, L"VB", G->mSelectedVertexBufferPos, G->mVisitedVertexBuffers.size());
+	if (G->mSelectedVertexBuffer != -1 || G->gSelectedVertexBufferSlotId != -1) {
+		wchar_t osdString[maxstring];
+		swprintf_s(osdString, maxstring, (G->gSelectedVertexBufferSlotId == -1) ? L"VB" : L"VB%u", G->gSelectedVertexBufferSlotId);
+		AppendShaderText(counts, osdString, G->mSelectedVertexBufferPos, G->mVisitedVertexBuffers.size());
+	}
 	if (G->mSelectedIndexBuffer != -1)
 		AppendShaderText(counts, L"IB", G->mSelectedIndexBufferPos, G->mVisitedIndexBuffers.size());
 	if (G->mSelectedRenderTarget != (ID3D11Resource *)-1)
 		AppendShaderText(counts, L"RT", G->mSelectedRenderTargetPos, G->mVisitedRenderTargets.size());
-
-	marking_mode = lookup_enum_name(MarkingModeNames, G->marking_mode);
-	if (marking_mode)
-		wcscat_s(counts, maxstring, marking_mode);
 }
 
 
@@ -622,6 +619,25 @@ static bool FindInfoText(wchar_t *info, UINT64 selectedShader)
 	return false;
 }
 
+std::wstring FormatSet(const std::set<uint32_t>& s, const std::wstring& sep, const uint32_t def)
+{
+	if (s.empty())
+		return std::to_wstring(def);
+
+	std::wstring result;
+	bool first = true;
+
+	for (uint32_t v : s)
+	{
+		if (!first)
+			result += sep;
+
+		result += std::to_wstring(v);
+		first = false;
+	}
+
+	return result;
+}
 
 // This is for a line of text as info about the currently selected shader.
 // The line is pulled out of the header of the HLSL text file, and can be
@@ -651,7 +667,23 @@ void Overlay::DrawShaderInfoLine(char *type, UINT64 selectedShader, float *y, bo
 		if (selectedShader == 0xffffffff || !G->verbose_overlay)
 			return;
 
-		swprintf_s(osdString, maxstring, L"%S %08llx", type, selectedShader);
+		DrawCallInfo* drawInfo;
+
+		if (strcmp(type, "VB") == 0) {
+			drawInfo = &G->gSelectedVertexBufferDrawInfo;
+			uint32_t fallback_slot_id = G->gSelectedVertexBufferSlotId >= 0 ? G->gSelectedVertexBufferSlotId : 0;
+			swprintf_s(osdString, maxstring, L"%S%s %08llx", type, FormatSet(G->gVisitedVertexBufferSlotIds, L"/", fallback_slot_id).c_str(), selectedShader);
+		} else {
+			drawInfo = &G->gSelectedIndexBufferDrawInfo;
+			swprintf_s(osdString, maxstring, L"%S %08llx", type, selectedShader);
+		}
+
+		size_t len = wcslen(osdString);
+
+		if (drawInfo->IndexCount)
+			swprintf_s(osdString + len, maxstring - len, L" (IndexCount: %u, FirstIndex: %u)", drawInfo->IndexCount, drawInfo->FirstIndex);
+		else if (drawInfo->VertexCount)
+			swprintf_s(osdString + len, maxstring - len, L" (VertexCount: %u, FirstVertex: %u)", drawInfo->VertexCount, drawInfo->FirstVertex);
 	}
 
 	strSize = mFont->MeasureString(osdString);
@@ -744,36 +776,12 @@ void Overlay::DrawProfiling(float *y)
 	mFontProfiling->DrawString(mSpriteBatch.get(), Profiling::text.c_str(), Vector2(0, *y), DirectX::Colors::Goldenrod);
 }
 
-// Create a string for display on the bottom edge of the screen, that contains the current
-// stereo info of separation and convergence. 
-// Desired format: "Sep:85  Conv:4.5"
-
-static void CreateStereoInfoString(StereoHandle stereoHandle, wchar_t *info)
+static void CreateInfoString(wchar_t* info)
 {
-	// Rather than draw graphic bars, this will just be numeric.  Because
-	// convergence is essentially an arbitrary number.
+	const wchar_t* marking_mode;
+	marking_mode = lookup_enum_name(MarkingModeNames, G->marking_mode);
 
-	float separation, convergence;
-	NvU8 stereo = !!stereoHandle;
-	if (stereo)
-	{
-		NvAPIOverride();
-		Profiling::NvAPI_Stereo_IsEnabled(&stereo);
-		if (stereo)
-		{
-			Profiling::NvAPI_Stereo_IsActivated(stereoHandle, &stereo);
-			if (stereo)
-			{
-				Profiling::NvAPI_Stereo_GetSeparation(stereoHandle, &separation);
-				Profiling::NvAPI_Stereo_GetConvergence(stereoHandle, &convergence);
-			}
-		}
-	}
-
-	if (stereo)
-		swprintf_s(info, maxstring, L"Sep:%.0f  Conv:%.2f", separation, convergence);
-	else
-		swprintf_s(info, maxstring, L"Stereo disabled");
+	swprintf_s(info, maxstring, L"Shader Hunting Mode (marking: %ls)", marking_mode);
 }
 
 void Overlay::DrawOverlay(void)
@@ -814,7 +822,7 @@ void Overlay::DrawOverlay(void)
 				DrawShaderInfoLines(&y);
 
 				// Bottom of screen
-				CreateStereoInfoString(mHackerDevice->mStereoHandle, osdString);
+				CreateInfoString(osdString);
 				strSize = mFont->MeasureString(osdString);
 				textPosition = Vector2(float(mResolution.x - strSize.x) / 2, float(mResolution.y - strSize.y - 10));
 				DrawOutlinedString(mFont.get(), osdString, textPosition, DirectX::Colors::LimeGreen);
@@ -863,16 +871,27 @@ void ClearNotices()
 
 void LogOverlayW(LogLevel level, wchar_t *fmt, ...)
 {
-	wchar_t msg[maxstring];
+	bool show_overlay_message = (level == LOG_INFO) || G->gShowWarnings;
+
+	if (!show_overlay_message && gLogVerbosity < LogVerbosity::WARNING)
+		return;
+
 	va_list ap;
 
 	va_start(ap, fmt);
-	vLogInfoW(fmt, ap);
+
+	vLogWarningW(fmt, ap);
+
+	if (!show_overlay_message) {
+		va_end(ap);
+		return;
+	}
 
 	// Using _vsnwprintf_s so we don't crash if the message is too long for
 	// the buffer, and truncate it instead - unless we can automatically
 	// wrap the message, which DirectXTK doesn't appear to support, who
 	// cares if it gets cut off somewhere off screen anyway?
+	wchar_t msg[maxstring];
 	_vsnwprintf_s(msg, maxstring, _TRUNCATE, fmt, ap);
 
 	EnterCriticalSectionPretty(&notices.lock);
@@ -892,14 +911,26 @@ void LogOverlayW(LogLevel level, wchar_t *fmt, ...)
 // format string correctly and convert the result to a wide string.
 void LogOverlay(LogLevel level, char *fmt, ...)
 {
-	char amsg[maxstring];
-	wchar_t wmsg[maxstring];
+	bool show_overlay_message = (level == LOG_INFO) || G->gShowWarnings;
+
+	if (!show_overlay_message && gLogVerbosity < LogVerbosity::WARNING)
+		return;
+
 	va_list ap;
 
 	va_start(ap, fmt);
-	vLogInfo(fmt, ap);
+
+	vLogWarning(fmt, ap);
+
+	if (!show_overlay_message) {
+		va_end(ap);
+		return;
+	}
 
 	if (!log_levels[level].hide_in_release || G->hunting) {
+		char amsg[maxstring];
+		wchar_t wmsg[maxstring];
+
 		// Using _vsnprintf_s so we don't crash if the message is too long for
 		// the buffer, and truncate it instead - unless we can automatically
 		// wrap the message, which DirectXTK doesn't appear to support, who

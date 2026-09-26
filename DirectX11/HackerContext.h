@@ -7,8 +7,8 @@
 
 #include "CommandList.h"
 
+#include "HackerInputLayout.h"
 #include "HackerDevice.h"
-//#include "ResourceHash.h"
 #include "Globals.h"
 
 // {A3046B1E-336B-4D90-9FD6-234BC09B8687}
@@ -32,7 +32,6 @@ struct ShaderOverride;
 
 struct DrawContext
 {
-	float oldSeparation;
 	ID3D11PixelShader *oldPixelShader;
 	ID3D11VertexShader *oldVertexShader;
 	CommandList *post_commands[5];
@@ -42,7 +41,6 @@ struct DrawContext
 			UINT VertexCount, UINT IndexCount, UINT InstanceCount,
 			UINT FirstVertex, UINT FirstIndex, UINT FirstInstance,
 			ID3D11Buffer **indirect_buffer, UINT args_offset) :
-		oldSeparation(FLT_MAX),
 		oldVertexShader(NULL),
 		oldPixelShader(NULL),
 		call_info(type, VertexCount, IndexCount, InstanceCount, FirstVertex, FirstIndex, FirstInstance,
@@ -76,11 +74,13 @@ struct MappedResourceInfo {
 	bool mapped_writable;
 	void *orig_pData;
 	size_t size;
+	UINT bind_flags;
 
 	MappedResourceInfo() :
 		orig_pData(NULL),
 		size(0),
-		mapped_writable(false)
+		mapped_writable(false),
+		bind_flags(0)
 	{}
 };
 
@@ -119,14 +119,34 @@ private:
 	// These are per-context, moved from globals.h:
 	uint32_t mCurrentVertexBuffers[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
 	uint32_t mCurrentIndexBuffer; // Only valid while hunting=1
+	struct VertexBufferBinding {
+		ID3D11Buffer* buffer;
+		UINT offset;
+		UINT stride;
+	} mCurrentVertexBuffersBindings[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+	struct IndexBufferBinding {
+		ID3D11Buffer* buffer;
+		UINT offset;
+		DXGI_FORMAT format;
+		bool is_explicit;
+	} mCurrentIndexBufferBinding;
 	std::vector<ID3D11Resource *> mCurrentRenderTargets;
 	ID3D11Resource *mCurrentDepthTarget;
 	UINT mCurrentPSUAVStartSlot;
 	UINT mCurrentPSNumUAVs;
 
+	HackerInputLayout* mCurrentInputLayout;
+	HackerInputLayout* mOriginalInputLayout;
+	HackerInputLayout* mOverrideInputLayout;
+
 	// Used for deny_cpu_read, track_texture_updates and constant buffer matching
 	typedef std::unordered_map<ID3D11Resource*, MappedResourceInfo> MappedResources;
 	MappedResources mMappedResources;
+
+	unsigned draw_number;
+	unsigned dispatch_number;
+
+	FlatHashMap<UINT, ID3D11Buffer*> mReadbackBuffers = FlatHashMap<UINT, ID3D11Buffer*>(64);
 
 	// These private methods are utility routines for HackerContext.
 	void BeforeDraw(DrawContext &data);
@@ -147,6 +167,7 @@ private:
 	bool MapDenyCPURead(ID3D11Resource *pResource, UINT Subresource,
 			D3D11_MAP MapType, UINT MapFlags,
 			D3D11_MAPPED_SUBRESOURCE *pMappedResource);
+	bool MapTrackRegionHashes(ID3D11Resource* pResource, D3D11_MAP MapType, D3D11_RESOURCE_DIMENSION* dim);
 	void TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 		UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
 		D3D11_MAPPED_SUBRESOURCE *pMappedResource);
@@ -189,7 +210,7 @@ private:
 			UINT StartSlot,
 			UINT NumViews,
 			ID3D11ShaderResourceView *const *ppShaderResourceViews)>
-	void BindStereoResources();
+	void BindResources();
 	template <void (__stdcall ID3D11DeviceContext::*OrigSetShaderResources)(THIS_
 			UINT StartSlot,
 			UINT NumViews,
@@ -210,6 +231,7 @@ protected:
 
 public:
 	HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pContext1);
+	~HackerContext();
 
 	void SetHackerDevice(HackerDevice *pDevice);
 	HackerDevice* GetHackerDevice();
@@ -224,6 +246,16 @@ public:
 	virtual void FrameAnalysisTrigger(FrameAnalysisOptions new_options) {};
 	virtual void FrameAnalysisDump(ID3D11Resource *resource, FrameAnalysisOptions options,
 		const wchar_t *target, DXGI_FORMAT format, UINT stride, UINT offset) {};
+
+	unsigned GetDrawNumber() const { return draw_number; };
+	unsigned GetDispatchNumber() const { return dispatch_number; };
+	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
+
+	ID3D11Buffer* GetReadbackBuffer(UINT size);
+
+	void DeferInputLayoutOverride(HackerInputLayout* pInputLayout);
+	void OverrideInputLayout();
+	void RestoreInputLayout();
 
 	// These are the shaders the game has set, which may be different from
 	// the ones we have bound to the pipeline:

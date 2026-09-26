@@ -9,7 +9,6 @@
     <ClCompile Include="IniHandler.cpp" />
     <ClCompile Include="Input.cpp" />
     <ClCompile Include="Overlay.cpp" />
-    <ClCompile Include="Override.cpp" />
     <ClCompile Include="..\HLSLDecompiler\DecompileHLSL.cpp" />
     <ClCompile Include="HookedDXGI.cpp" />
     <ClCompile Include="FrameAnalysis.cpp" />
@@ -19,7 +18,6 @@
     <ClCompile Include="ResourceHash.cpp" />
     <ClCompile Include="HookedContext.cpp" />
     <ClCompile Include="HookedDevice.cpp" />
-    <ClCompile Include="nvprofile.cpp" />
     <ClCompile Include="..\D3D_Shaders\SignatureParser.cpp" />
     <ClCompile Include="ShaderRegex.cpp" />
     <ClCompile Include="HookAddresses.c" />
@@ -30,6 +28,9 @@
     <ClCompile Include="..\ini_parser_lite.cpp" />
     <ClCompile Include="lock.cpp" />
     <ClCompile Include="cursor.cpp" />
+    <ClCompile Include="Override.cpp" />
+    <ClCompile Include="HackerInputLayout.cpp" />
+    <ClCompile Include="ByteCodeReader.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="d3d11Wrapper.def" />
@@ -43,7 +44,6 @@
     <ClInclude Include="IniHandler.h" />
     <ClInclude Include="Input.h" />
     <ClInclude Include="Overlay.h" />
-    <ClInclude Include="Override.h" />
     <ClInclude Include="..\vkeys.h" />
     <ClInclude Include="..\HLSLDecompiler\DecompileHLSL.h" />
     <ClInclude Include="HookedDXGI.h" />
@@ -57,13 +57,16 @@
     <ClInclude Include="HookedContext.h" />
     <ClInclude Include="HookedDevice.h" />
     <ClInclude Include="..\shader.h" />
-    <ClInclude Include="nvprofile.h" />
     <ClInclude Include="ShaderRegex.h" />
     <ClInclude Include="FrameAnalysis.h" />
     <ClInclude Include="HackerDXGI.h" />
     <ClInclude Include="profiling.h" />
     <ClInclude Include="lock.h" />
     <ClInclude Include="cursor.h" />
+    <ClInclude Include="Override.h" />
+    <ClInclude Include="HackerInputLayout.h" />
+    <ClInclude Include="d3d11TokenizedProgramFormat.hpp" />
+    <ClInclude Include="ByteCodeReader.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="DirectX11.rc" />

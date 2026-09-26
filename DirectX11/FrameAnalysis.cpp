@@ -1,5 +1,6 @@
 // Include before util.h (or any header that includes util.h) to get pretty
 // version of LockResourceCreationMode:
+
 #include "lock.h"
 
 #include "D3D11Wrapper.h"
@@ -12,11 +13,14 @@
 #include <Strsafe.h>
 #include <stdarg.h>
 #include <Shlwapi.h>
-#include <stdexcept>
+
+#include <locale>
 
 // For windows shortcuts:
 #include <shobjidl.h>
 #include <shlguid.h>
+
+#include <stdexcept>
 
 // Flag introduced in Windows 10 Fall Creators Update
 // Someone was clearly on crack when they decided this flag was necessary
@@ -97,6 +101,59 @@ void FrameAnalysisContext::vFrameAnalysisLog(char *fmt, va_list ap)
 	vfprintf(frame_analysis_log, fmt, ap);
 }
 
+void FrameAnalysisContext::vFrameAnalysisLogW(wchar_t* fmt, va_list ap)
+{
+	wchar_t filename[MAX_PATH];
+
+	LogDebugNoNL("FrameAnalysisContext(%s@%p)::", type_name(this), this);
+	vLogDebugW(fmt, ap);
+
+	if (!G->analyse_frame) {
+		if (frame_analysis_log)
+			fclose(frame_analysis_log);
+		frame_analysis_log = NULL;
+		return;
+	}
+
+	// DSS note: the below comment was originally referring to the
+	// C->cur_analyse_options & FrameAnalysisOptions::LOG test we used to
+	// have here, but even though we removed that test this is still a good
+	// reminder for other settings as well.
+	//
+	// Using the global analyse options here as the local copy in the
+	// context is only updated after draw calls. We could potentially
+	// process the triggers here, but this function is intended to log
+	// other calls as well where that wouldn't make sense. We could change
+	// it so that this is called from FrameAnalysisAfterDraw, but we want
+	// to log calls for deferred contexts here as well.
+
+	if (!frame_analysis_log) {
+		// Use the original context to check the type, otherwise we
+		// will recursively call ourselves:
+		if (GetPassThroughOrigContext1()->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
+			swprintf_s(filename, MAX_PATH, L"%ls\\log.txt", G->ANALYSIS_PATH);
+		else
+			swprintf_s(filename, MAX_PATH, L"%ls\\log-0x%p.txt", G->ANALYSIS_PATH, this);
+
+		frame_analysis_log = _wfsopen(filename, L"w", _SH_DENYNO);
+		if (!frame_analysis_log) {
+			LogInfoW(L"Error opening %s\n", filename);
+			return;
+		}
+		draw_call = 1;
+
+		fprintf(frame_analysis_log, "analyse_options: %08x\n", G->cur_analyse_options);
+	}
+
+	// We don't allow hold to be changed mid-frame due to potential
+	// for filename conflicts, so use def_analyse_options:
+	if (G->def_analyse_options & FrameAnalysisOptions::HOLD)
+		fprintf(frame_analysis_log, "%u.", G->analyse_frame_no);
+	fprintf(frame_analysis_log, "%06u ", draw_call);
+
+	vfwprintf(frame_analysis_log, fmt, ap);
+}
+
 void FrameAnalysisContext::FrameAnalysisLog(char *fmt, ...)
 {
 	va_list ap;
@@ -106,13 +163,22 @@ void FrameAnalysisContext::FrameAnalysisLog(char *fmt, ...)
 	va_end(ap);
 }
 
+void FrameAnalysisContext::FrameAnalysisLogW(wchar_t* fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vFrameAnalysisLogW(fmt, ap);
+	va_end(ap);
+}
+
 #define FALogInfo(fmt, ...) { \
-	FrameAnalysisLog("3DMigoto " fmt, __VA_ARGS__); \
+	FrameAnalysisLogW("3DMigoto " fmt, __VA_ARGS__); \
 } while (0)
 
 #define FALogErr(fmt, ...) { \
-	LogInfo("Frame Analysis: " fmt, __VA_ARGS__); \
-	FrameAnalysisLog("3DMigoto " fmt, __VA_ARGS__); \
+	LogInfoW("Frame Analysis: " fmt, __VA_ARGS__); \
+	FrameAnalysisLogW("3DMigoto " fmt, __VA_ARGS__); \
 } while (0)
 
 
@@ -151,21 +217,13 @@ void FrameAnalysisContext::FrameAnalysisLogShaderHash(ID3D11Shader *shader)
 	fprintf(frame_analysis_log, "\n");
 }
 
-void FrameAnalysisContext::FrameAnalysisLogResourceHash(ID3D11Resource *resource)
+void FrameAnalysisContext::FrameAnalysisLogResourceHashInline(ID3D11Resource *resource)
 {
 	uint32_t hash, orig_hash;
 	struct ResourceHashInfo *info;
 
-	// Always complete the line in the debug log:
-	LogDebug("\n");
-
-	if (!G->analyse_frame || !frame_analysis_log)
+	if (!G->analyse_frame || !frame_analysis_log || !resource)
 		return;
-
-	if (!resource) {
-		fprintf(frame_analysis_log, "\n");
-		return;
-	}
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 	EnterCriticalSectionPretty(&G->mResourcesLock);
@@ -195,6 +253,17 @@ void FrameAnalysisContext::FrameAnalysisLogResourceHash(ID3D11Resource *resource
 
 	LeaveCriticalSection(&G->mResourcesLock);
 	LeaveCriticalSection(&G->mCriticalSection);
+}
+
+void FrameAnalysisContext::FrameAnalysisLogResourceHash(ID3D11Resource* resource)
+{
+	// Always complete the line in the debug log:
+	LogDebug("\n");
+
+	if (!G->analyse_frame || !frame_analysis_log)
+		return;
+
+	FrameAnalysisLogResourceHashInline(resource);
 
 	fprintf(frame_analysis_log, "\n");
 }
@@ -389,6 +458,33 @@ void FrameAnalysisContext::FrameAnalysisLogData(void *buf, UINT size)
 	fprintf(frame_analysis_log, "\n");
 }
 
+void FrameAnalysisContext::FrameAnalysisLogConstantBuffer(int slot, char* slot_name, ID3D11Resource* resource, UINT first_constant, UINT num_constants)
+{
+	if (!resource || !G->analyse_frame || !frame_analysis_log)
+		return;
+
+	FrameAnalysisLogSlot(frame_analysis_log, slot, slot_name);
+	fprintf(frame_analysis_log, " resource=0x%p", resource);
+
+	FrameAnalysisLogResourceHashInline(resource);
+
+	fprintf(frame_analysis_log, " first_constant=%u num_constants=%u", first_constant, num_constants);
+
+	fprintf(frame_analysis_log, "\n");
+	LogDebug("\n");
+}
+
+void FrameAnalysisContext::FrameAnalysisLogConstantBufferArray(UINT start, UINT len, ID3D11Resource* const* ppResources, const UINT* pFirstConstant, const UINT* pNumConstants)
+{
+	UINT i;
+
+	if (!ppResources || !G->analyse_frame || !frame_analysis_log)
+		return;
+
+	for (i = 0; i < len; i++)
+		FrameAnalysisLogConstantBuffer(start + i, NULL, ppResources[i], pFirstConstant ? pFirstConstant[i] : 0, pNumConstants ? pNumConstants[i] : 0);
+}
+
 ID3D11DeviceContext* FrameAnalysisContext::GetDumpingContext()
 {
 	if (GetPassThroughOrigContext1()->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
@@ -409,12 +505,12 @@ ID3D11DeviceContext* FrameAnalysisContext::GetDumpingContext()
 }
 
 void FrameAnalysisContext::Dump2DResourceImmediateCtx(ID3D11Texture2D *staging,
-		wstring filename, bool stereo, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format)
+		wstring filename, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format)
 {
-	HRESULT hr = S_OK, dont_care;
+	HRESULT hr = S_OK;
 	wchar_t dedupe_filename[MAX_PATH];
 	wstring save_filename;
-	wchar_t *wic_ext = (stereo ? L".jps" : L".jpg");
+	wchar_t *wic_ext = L".jpg";
 	size_t ext, save_ext;
 
 	save_filename = dedupe_tex2d_filename(staging, orig_desc, dedupe_filename, MAX_PATH, filename.c_str(), format);
@@ -422,12 +518,12 @@ void FrameAnalysisContext::Dump2DResourceImmediateCtx(ID3D11Texture2D *staging,
 	ext = filename.find_last_of(L'.');
 	save_ext = save_filename.find_last_of(L'.');
 	if (ext == wstring::npos || save_ext == wstring::npos) {
-		FALogErr("Dump2DResource: Filename missing extension\n");
+		FALogErr(L"Dump2DResource: Filename missing extension\n");
 		return;
 	}
 
 	// Needs to be called at some point before SaveXXXTextureToFile:
-	dont_care = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	EnsureCOM();
 
 	if ((analyse_options & FrameAnalysisOptions::FMT_2D_JPS) ||
 	    (analyse_options & FrameAnalysisOptions::FMT_2D_AUTO)) {
@@ -440,7 +536,7 @@ void FrameAnalysisContext::Dump2DResourceImmediateCtx(ID3D11Texture2D *staging,
 		// will dump out DDS files for those instead.
 		filename.replace(ext, wstring::npos, wic_ext);
 		save_filename.replace(save_ext, wstring::npos, wic_ext);
-		FALogInfo("Dumping Texture2D %S -> %S\n", filename.c_str(), save_filename.c_str());
+		FALogInfo(L"Dumping Texture2D %ls -> %ls\n", filename.c_str(), save_filename.c_str());
 
 		hr = S_OK;
 		if (GetFileAttributes(save_filename.c_str()) == INVALID_FILE_ATTRIBUTES)
@@ -453,7 +549,7 @@ void FrameAnalysisContext::Dump2DResourceImmediateCtx(ID3D11Texture2D *staging,
 	   ((analyse_options & FrameAnalysisOptions::FMT_2D_AUTO) && FAILED(hr))) {
 		filename.replace(ext, wstring::npos, L".dds");
 		save_filename.replace(save_ext, wstring::npos, L".dds");
-		FALogInfo("Dumping Texture2D %S -> %S\n", filename.c_str(), save_filename.c_str());
+		FALogInfo(L"Dumping Texture2D %ls -> %ls\n", filename.c_str(), save_filename.c_str());
 
 		hr = S_OK;
 		if (GetFileAttributes(save_filename.c_str()) == INVALID_FILE_ATTRIBUTES)
@@ -462,23 +558,21 @@ void FrameAnalysisContext::Dump2DResourceImmediateCtx(ID3D11Texture2D *staging,
 	}
 
 	if (FAILED(hr))
-		FALogErr("Failed to dump Texture2D %S -> %S: 0x%x\n", filename.c_str(), save_filename.c_str(), hr);
+		FALogErr(L"Failed to dump Texture2D %ls -> %ls: 0x%x\n", filename.c_str(), save_filename.c_str(), hr);
 
 	if (analyse_options & FrameAnalysisOptions::FMT_DESC) {
 		filename.replace(ext, wstring::npos, L".dsc");
 		save_filename.replace(save_ext, wstring::npos, L".dsc");
-		FALogInfo("Dumping Texture2D %S -> %S\n", filename.c_str(), save_filename.c_str());
+		FALogInfo(L"Dumping Texture2D %ls -> %ls\n", filename.c_str(), save_filename.c_str());
 
 		if (GetFileAttributes(save_filename.c_str()) == INVALID_FILE_ATTRIBUTES)
 			DumpDesc(orig_desc, save_filename.c_str());
 		link_deduplicated_files(filename.c_str(), save_filename.c_str());
 	}
-
-	CoUninitialize();
 }
 
 void FrameAnalysisContext::Dump2DResource(ID3D11Texture2D *resource, wchar_t
-		*filename, bool stereo, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format)
+		*filename, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format)
 {
 	HRESULT hr = S_OK;
 	ID3D11Texture2D *staging = resource;
@@ -499,24 +593,20 @@ void FrameAnalysisContext::Dump2DResource(ID3D11Texture2D *resource, wchar_t
 	if (!orig_desc)
 		desc = &staging_desc;
 
-	if (!DeferDump2DResource(staging, filename, stereo, desc, format))
-		Dump2DResourceImmediateCtx(staging, filename, stereo, desc, format);
+	if (!DeferDump2DResource(staging, filename, desc, format))
+		Dump2DResourceImmediateCtx(staging, filename, desc, format);
 
 	if (staging != resource)
 		staging->Release();
 }
 
 HRESULT FrameAnalysisContext::CreateStagingResource(ID3D11Texture2D **resource,
-		D3D11_TEXTURE2D_DESC desc, bool stereo, bool msaa, DXGI_FORMAT format)
+		D3D11_TEXTURE2D_DESC desc, bool msaa, DXGI_FORMAT format)
 {
-	NVAPI_STEREO_SURFACECREATEMODE orig_mode = NVAPI_STEREO_SURFACECREATEMODE_AUTO;
 	HRESULT hr;
 
 	// NOTE: desc is passed by value - this is intentional so we don't
 	// modify desc in the caller
-
-	if (stereo)
-		desc.Width *= 2;
 
 	if (msaa) {
 		// Resolving MSAA requires these flags:
@@ -551,24 +641,7 @@ HRESULT FrameAnalysisContext::CreateStagingResource(ID3D11Texture2D **resource,
 
 	LockResourceCreationMode();
 
-	if (analyse_options & FrameAnalysisOptions::STEREO) {
-		// If we are dumping stereo at all force surface creation mode
-		// to stereo (regardless of whether we are creating this double
-		// width) to prevent driver heuristics interfering. If the
-		// original surface was mono that's ok - thaks to the
-		// intermediate stages we'll end up with both eyes the same
-		// (without this one eye would be blank instead, which is
-		// arguably better since it will be immediately obvious, but
-		// risks missing the second perspective if the original
-		// resource was actually stereo)
-		Profiling::NvAPI_Stereo_GetSurfaceCreationMode(GetHackerDevice()->mStereoHandle, &orig_mode);
-		Profiling::NvAPI_Stereo_SetSurfaceCreationMode(GetHackerDevice()->mStereoHandle, NVAPI_STEREO_SURFACECREATEMODE_FORCESTEREO);
-	}
-
 	hr = GetHackerDevice()->GetPassThroughOrigDevice1()->CreateTexture2D(&desc, NULL, resource);
-
-	if (analyse_options & FrameAnalysisOptions::STEREO)
-		Profiling::NvAPI_Stereo_SetSurfaceCreationMode(GetHackerDevice()->mStereoHandle, orig_mode);
 
 	UnlockResourceCreationMode();
 
@@ -590,9 +663,9 @@ HRESULT FrameAnalysisContext::ResolveMSAA(ID3D11Texture2D *src,
 	// Resolve MSAA surfaces. Procedure copied from DirectXTK
 	// These need to have D3D11_USAGE_DEFAULT to resolve,
 	// so we need yet another intermediate texture:
-	hr = CreateStagingResource(&resolved, *srcDesc, false, true, format);
+	hr = CreateStagingResource(&resolved, *srcDesc, true, format);
 	if (FAILED(hr)) {
-		FALogErr("ResolveMSAA failed to create intermediate texture: 0x%x\n", hr);
+		FALogErr(L"ResolveMSAA failed to create intermediate texture: 0x%x\n", hr);
 		return hr;
 	}
 
@@ -601,7 +674,7 @@ HRESULT FrameAnalysisContext::ResolveMSAA(ID3D11Texture2D *src,
 
 	hr = GetHackerDevice()->GetPassThroughOrigDevice1()->CheckFormatSupport( fmt, &support );
 	if (FAILED(hr) || !(support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE)) {
-		FALogErr("ResolveMSAA cannot resolve MSAA format %d\n", fmt);
+		FALogErr(L"ResolveMSAA cannot resolve MSAA format %d\n", fmt);
 		goto err_release;
 	}
 
@@ -629,9 +702,9 @@ HRESULT FrameAnalysisContext::StageResource(ID3D11Texture2D *src,
 
 	*dst = NULL;
 
-	hr = CreateStagingResource(&staging, *srcDesc, false, false, format);
+	hr = CreateStagingResource(&staging, *srcDesc, false, format);
 	if (FAILED(hr)) {
-		FALogErr("StageResource failed to create intermediate texture: 0x%x\n", hr);
+		FALogErr(L"StageResource failed to create intermediate texture: 0x%x\n", hr);
 		return hr;
 	}
 
@@ -653,66 +726,6 @@ err_release:
 	if (staging)
 		staging->Release();
 	return hr;
-}
-
-// TODO: Refactor this with StereoScreenShot().
-// Expects the reverse stereo blit to be enabled by the caller
-void FrameAnalysisContext::DumpStereoResource(ID3D11Texture2D *resource, wchar_t *filename, DXGI_FORMAT format)
-{
-	ID3D11Texture2D *stereoResource = NULL;
-	ID3D11Texture2D *tmpResource = NULL;
-	ID3D11Texture2D *src = resource;
-	D3D11_TEXTURE2D_DESC srcDesc;
-	D3D11_BOX srcBox;
-	HRESULT hr;
-	UINT item, level, index, width, height;
-
-	resource->GetDesc(&srcDesc);
-
-	hr = CreateStagingResource(&stereoResource, srcDesc, true, false, format);
-	if (FAILED(hr)) {
-		FALogErr("DumpStereoResource failed to create stereo texture: 0x%x\n", hr);
-		return;
-	}
-
-	if ((srcDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL) ||
-	    (srcDesc.SampleDesc.Count > 1)) {
-		// Reverse stereo blit won't work on these surfaces directly
-		// since CopySubresourceRegion() will fail if the source and
-		// destination dimensions don't match, so use yet another
-		// intermediate staging resource first.
-		hr = StageResource(src, &srcDesc, &tmpResource, format);
-		if (FAILED(hr))
-			goto out;
-		src = tmpResource;
-	}
-
-	// Set the source box as per the nvapi documentation:
-	srcBox.left = 0;
-	srcBox.top = 0;
-	srcBox.front = 0;
-	srcBox.right = width = srcDesc.Width;
-	srcBox.bottom = height = srcDesc.Height;
-	srcBox.back = 1;
-
-	// Perform the reverse stereo blit on all sub-resources and mip-maps:
-	for (item = 0; item < srcDesc.ArraySize; item++) {
-		for (level = 0; level < srcDesc.MipLevels; level++) {
-			index = D3D11CalcSubresource(level, item, max(srcDesc.MipLevels, 1));
-			srcBox.right = width >> level;
-			srcBox.bottom = height >> level;
-			GetPassThroughOrigContext1()->CopySubresourceRegion(stereoResource, index, 0, 0, 0,
-					src, index, &srcBox);
-		}
-	}
-
-	Dump2DResource(stereoResource, filename, true, &srcDesc, format);
-
-	if (tmpResource)
-		tmpResource->Release();
-
-out:
-	stereoResource->Release();
 }
 
 static void copy_until_extension(wchar_t *txt_filename, const wchar_t *bin_filename, size_t size, wchar_t **pos, size_t *rem)
@@ -748,7 +761,7 @@ void FrameAnalysisContext::dedupe_buf_filename_txt(const wchar_t *bin_filename,
 		StringCchPrintfExW(pos, rem, &pos, &rem, NULL, L"-stride=%u", stride);
 
 	if (FAILED(StringCchPrintfW(pos, rem, L".txt")))
-		FALogErr("Failed to create buffer filename\n");
+		FALogErr(L"Failed to create buffer filename\n");
 }
 
 /*
@@ -767,7 +780,7 @@ void FrameAnalysisContext::DumpBufferTxt(wchar_t *filename, D3D11_MAPPED_SUBRESO
 
 	err = wfopen_ensuring_access(&fd, filename, L"w");
 	if (!fd) {
-		FALogErr("Unable to create %S: %u\n", filename, err);
+		FALogErr(L"Unable to create %ls: %u\n", filename, err);
 		return;
 	}
 
@@ -839,19 +852,18 @@ static const char* TopologyStr(D3D11_PRIMITIVE_TOPOLOGY topology)
 
 void FrameAnalysisContext::dedupe_buf_filename_vb_txt(const wchar_t *bin_filename,
 		wchar_t *txt_filename, size_t size, int idx, UINT stride,
-		UINT offset, UINT first, UINT count, ID3DBlob *layout,
+		UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 		D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info)
 {
 	wchar_t *pos;
 	size_t rem;
-	uint32_t layout_hash;
 
 	copy_until_extension(txt_filename, bin_filename, MAX_PATH, &pos, &rem);
 
 	StringCchPrintfExW(pos, rem, &pos, &rem, NULL, L"-vb%i", idx);
 
 	if (layout) {
-		layout_hash = crc32c_hw(0, layout->GetBufferPointer(), layout->GetBufferSize());
+		uint32_t layout_hash = layout->GetLayoutHash();
 		StringCchPrintfExW(pos, rem, &pos, &rem, NULL, L"-layout=%08x", layout_hash);
 	}
 
@@ -877,10 +889,10 @@ void FrameAnalysisContext::dedupe_buf_filename_vb_txt(const wchar_t *bin_filenam
 		StringCchPrintfExW(pos, rem, &pos, &rem, NULL, L"-inst_count=%u", call_info->InstanceCount);
 
 	if (FAILED(StringCchPrintfW(pos, rem, L".txt")))
-		FALogErr("Failed to create vertex buffer filename\n");
+		FALogErr(L"Failed to create vertex buffer filename\n");
 }
 
-static void dump_ia_layout(FILE *fd, D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements, int slot, bool *per_vert, bool *per_inst)
+static void dump_ia_layout(FILE *fd, const D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements, int slot, bool *per_vert, bool *per_inst)
 {
 	UINT i;
 
@@ -1242,7 +1254,7 @@ static int fprint_dxgi_format(FILE *fd, DXGI_FORMAT format, uint8_t *buf)
 
 
 static void dump_vb_elem(FILE *fd, uint8_t *buf,
-		D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements,
+		const D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements,
 		int slot, UINT vb_idx, UINT elem, UINT stride)
 {
 	UINT offset = 0, alignment, size;
@@ -1280,7 +1292,7 @@ static void dump_vb_elem(FILE *fd, uint8_t *buf,
 }
 
 static void dump_vb_known_layout(FILE *fd, D3D11_MAPPED_SUBRESOURCE *map,
-		D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements,
+		const D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements,
 		UINT size, int slot, UINT offset, UINT first, UINT count, UINT stride)
 {
 	UINT vertex, elem, start, end;
@@ -1304,7 +1316,7 @@ static void dump_vb_known_layout(FILE *fd, D3D11_MAPPED_SUBRESOURCE *map,
 }
 
 static void dump_vb_instance_data(FILE *fd, D3D11_MAPPED_SUBRESOURCE *map,
-		D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements,
+		const D3D11_INPUT_ELEMENT_DESC *layout_desc, size_t layout_elements,
 		UINT size, int slot, UINT offset, UINT first, UINT count, UINT stride)
 {
 	UINT instance, idx, elem, start, end;
@@ -1338,18 +1350,18 @@ static void dump_vb_instance_data(FILE *fd, D3D11_MAPPED_SUBRESOURCE *map,
  * other info like the semantic).
  */
 void FrameAnalysisContext::DumpVBTxt(wchar_t *filename, D3D11_MAPPED_SUBRESOURCE *map,
-		UINT size, int slot, UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+		UINT size, int slot, UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 		D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info)
 {
 	FILE *fd = NULL;
 	errno_t err;
-	D3D11_INPUT_ELEMENT_DESC *layout_desc = NULL;
+	const D3D11_INPUT_ELEMENT_DESC *layout_desc = NULL;
 	size_t layout_elements;
 	bool per_vert = false, per_inst = false;
 
 	err = wfopen_ensuring_access(&fd, filename, L"w");
 	if (!fd) {
-		FALogErr("Unable to create %S: %u\n", filename, err);
+		FALogErr(L"Unable to create %ls: %u\n", filename, err);
 		return;
 	}
 
@@ -1367,12 +1379,12 @@ void FrameAnalysisContext::DumpVBTxt(wchar_t *filename, D3D11_MAPPED_SUBRESOURCE
 	if (topology != D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED)
 		fprintf(fd, "topology: %s\n", TopologyStr(topology));
 	if (layout) {
-		layout_desc = (D3D11_INPUT_ELEMENT_DESC*)layout->GetBufferPointer();
-		layout_elements = layout->GetBufferSize() / sizeof(D3D11_INPUT_ELEMENT_DESC);
+		layout_desc = layout->GetElements();
+		layout_elements = layout->GetElementCount();
 		dump_ia_layout(fd, layout_desc, layout_elements, slot, &per_vert, &per_inst);
 	}
 	if (!stride) {
-		FALogErr("Cannot dump vertex buffer with stride=0\n");
+		FALogErr(L"Cannot dump vertex buffer with stride=0\n");
 		goto out_close;
 	}
 
@@ -1425,7 +1437,7 @@ void FrameAnalysisContext::dedupe_buf_filename_ib_txt(const wchar_t *bin_filenam
 		StringCchPrintfExW(pos, rem, &pos, &rem, NULL, L"-count=%u", count);
 
 	if (FAILED(StringCchPrintfW(pos, rem, L".txt")))
-		FALogErr("Failed to create index buffer filename\n");
+		FALogErr(L"Failed to create index buffer filename\n");
 }
 
 void FrameAnalysisContext::DumpIBTxt(wchar_t *filename, D3D11_MAPPED_SUBRESOURCE *map,
@@ -1441,7 +1453,7 @@ void FrameAnalysisContext::DumpIBTxt(wchar_t *filename, D3D11_MAPPED_SUBRESOURCE
 
 	err = wfopen_ensuring_access(&fd, filename, L"w");
 	if (!fd) {
-		FALogErr("Unable to create %S: %u\n", filename, err);
+		FALogErr(L"Unable to create %ls: %u\n", filename, err);
 		return;
 	}
 
@@ -1518,7 +1530,7 @@ void FrameAnalysisContext::DumpDesc(DescType *desc, const wchar_t *filename)
 
 	err = wfopen_ensuring_access(&fd, filename, L"w");
 	if (!fd) {
-		FALogErr("Unable to create %S: %u\n", filename, err);
+		FALogErr(L"Unable to create %ls: %u\n", filename, err);
 		return;
 	}
 	fwrite(buf, 1, strlen(buf), fd);
@@ -1527,7 +1539,7 @@ void FrameAnalysisContext::DumpDesc(DescType *desc, const wchar_t *filename)
 }
 
 bool FrameAnalysisContext::DeferDump2DResource(ID3D11Texture2D *staging,
-		wchar_t *filename, bool stereo, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format)
+		wchar_t *filename, D3D11_TEXTURE2D_DESC *orig_desc, DXGI_FORMAT format)
 {
 	if (!(analyse_options & FrameAnalysisOptions::DEFRD_CTX_DELAY))
 		return false;
@@ -1537,11 +1549,11 @@ bool FrameAnalysisContext::DeferDump2DResource(ID3D11Texture2D *staging,
 
 	if (!deferred_tex2d) {
 		deferred_tex2d = make_unique<FrameAnalysisDeferredTex2D>();
-		FALogInfo("Creating deferred staging Texture2D list %p on context %p\n", deferred_tex2d.get(), this);
+		FALogInfo(L"Creating deferred staging Texture2D list %p on context %p\n", deferred_tex2d.get(), this);
 	}
 
-	FALogInfo("Deferring Texture2D dump: %S\n", filename);
-	deferred_tex2d->emplace_back(analyse_options, staging, filename, stereo, orig_desc, format);
+	FALogInfo(L"Deferring Texture2D dump: %ls\n", filename);
+	deferred_tex2d->emplace_back(analyse_options, staging, filename, orig_desc, format);
 
 	return true;
 }
@@ -1549,7 +1561,7 @@ bool FrameAnalysisContext::DeferDump2DResource(ID3D11Texture2D *staging,
 bool FrameAnalysisContext::DeferDumpBuffer(ID3D11Buffer *staging,
 		D3D11_BUFFER_DESC *orig_desc, wchar_t *filename,
 		FrameAnalysisOptions buf_type_mask, int idx, DXGI_FORMAT ib_fmt,
-		UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+		UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 		D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info,
 		ID3D11Buffer *staged_ib_for_vb, UINT ib_off_for_vb)
 {
@@ -1561,10 +1573,10 @@ bool FrameAnalysisContext::DeferDumpBuffer(ID3D11Buffer *staging,
 
 	if (!deferred_buffers) {
 		deferred_buffers = make_unique<FrameAnalysisDeferredBuffers>();
-		FALogInfo("Creating deferred staging Buffer list %p on context %p\n", deferred_buffers.get(), this);
+		FALogInfo(L"Creating deferred staging Buffer list %p on context %p\n", deferred_buffers.get(), this);
 	}
 
-	FALogInfo("Deferring Buffer dump: %S\n", filename);
+	FALogInfo(L"Deferring Buffer dump: %ls\n", filename);
 	deferred_buffers->emplace_back(analyse_options, staging, orig_desc, filename,
 			buf_type_mask, idx, ib_fmt, stride, offset, first, count, layout,
 			topology, call_info, staged_ib_for_vb, ib_off_for_vb);
@@ -1616,8 +1628,7 @@ void FrameAnalysisContext::dump_deferred_resources(ID3D11CommandList *command_li
 				break;
 
 			this->analyse_options = i.analyse_options;
-			Dump2DResourceImmediateCtx(i.staging.Get(), i.filename,
-					i.stereo, &i.orig_desc, i.format);
+			Dump2DResourceImmediateCtx(i.staging.Get(), i.filename, &i.orig_desc, i.format);
 		}
 	}
 
@@ -1632,13 +1643,13 @@ void FrameAnalysisContext::finish_deferred_resources(ID3D11CommandList *command_
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
 	if (deferred_buffers) {
-		FALogInfo("Finishing deferred staging Buffer list %p on context %p\n", deferred_buffers.get(), this);
+		FALogInfo(L"Finishing deferred staging Buffer list %p on context %p\n", deferred_buffers.get(), this);
 		frame_analysis_deferred_buffer_lists.erase(command_list);
 		frame_analysis_deferred_buffer_lists.emplace(command_list, std::move(deferred_buffers));
 	}
 
 	if (deferred_tex2d) {
-		FALogInfo("Finishing deferred staging Texture2D list %p on context %p\n", deferred_tex2d.get(), this);
+		FALogInfo(L"Finishing deferred staging Texture2D list %p on context %p\n", deferred_tex2d.get(), this);
 		frame_analysis_deferred_tex2d_lists.erase(command_list);
 		frame_analysis_deferred_tex2d_lists.emplace(command_list, std::move(deferred_tex2d));
 	}
@@ -1670,7 +1681,7 @@ void FrameAnalysisContext::determine_vb_count(UINT *count, ID3D11Buffer *staged_
 
 	hr = GetDumpingContext()->Map(staged_ib_for_vb, 0, D3D11_MAP_READ, 0, &ib_map);
 	if (FAILED(hr)) {
-		FALogErr("determine_vb_count failed to map index buffer staging resource: 0x%x\n", hr);
+		FALogErr(L"determine_vb_count failed to map index buffer staging resource: 0x%x\n", hr);
 		return;
 	}
 
@@ -1707,7 +1718,7 @@ void FrameAnalysisContext::determine_vb_count(UINT *count, ID3D11Buffer *staged_
 
 void FrameAnalysisContext::DumpBufferImmediateCtx(ID3D11Buffer *staging, D3D11_BUFFER_DESC *orig_desc,
 		wstring filename, FrameAnalysisOptions buf_type_mask, int idx,
-		DXGI_FORMAT ib_fmt, UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+		DXGI_FORMAT ib_fmt, UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 		D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info,
 		ID3D11Buffer *staged_ib_for_vb, UINT ib_off_for_vb)
 {
@@ -1721,7 +1732,7 @@ void FrameAnalysisContext::DumpBufferImmediateCtx(ID3D11Buffer *staging, D3D11_B
 
 	hr = GetDumpingContext()->Map(staging, 0, D3D11_MAP_READ, 0, &map);
 	if (FAILED(hr)) {
-		FALogErr("DumpBuffer failed to map staging resource: 0x%x\n", hr);
+		FALogErr(L"DumpBuffer failed to map staging resource: 0x%x\n", hr);
 		return;
 	}
 
@@ -1730,19 +1741,19 @@ void FrameAnalysisContext::DumpBufferImmediateCtx(ID3D11Buffer *staging, D3D11_B
 	ext = filename.find_last_of(L'.');
 	bin_ext = wcsrchr(bin_filename, L'.');
 	if (ext == wstring::npos || !bin_ext) {
-		FALogErr("DumpBuffer: Filename missing extension\n");
+		FALogErr(L"DumpBuffer: Filename missing extension\n");
 		goto out_unmap;
 	}
 
 	if (analyse_options & FrameAnalysisOptions::FMT_BUF_BIN) {
 		filename.replace(ext, wstring::npos, L".buf");
 		wcscpy_s(bin_ext, MAX_PATH + bin_filename - bin_ext, L".buf");
-		FALogInfo("Dumping Buffer %S -> %S\n", filename.c_str(), bin_filename);
+		FALogInfo(L"Dumping Buffer %ls -> %ls\n", filename.c_str(), bin_filename);
 
 		if (GetFileAttributes(bin_filename) == INVALID_FILE_ATTRIBUTES) {
 			err = wfopen_ensuring_access(&fd, bin_filename, L"wb");
 			if (!fd) {
-				FALogErr("Unable to create %S: %u\n", bin_filename, err);
+				FALogErr(L"Unable to create %ls: %u\n", bin_filename, err);
 				goto out_unmap;
 			}
 			fwrite(map.pData, 1, orig_desc->ByteWidth, fd);
@@ -1756,20 +1767,20 @@ void FrameAnalysisContext::DumpBufferImmediateCtx(ID3D11Buffer *staging, D3D11_B
 
 		if (buf_type_mask & FrameAnalysisOptions::DUMP_CB) {
 			dedupe_buf_filename_txt(bin_filename, txt_filename, MAX_PATH, 'c', idx, stride, offset);
-			FALogInfo("Dumping Buffer %S -> %S\n", filename.c_str(), txt_filename);
+			FALogInfo(L"Dumping Buffer %ls -> %ls\n", filename.c_str(), txt_filename);
 			if (GetFileAttributes(txt_filename) == INVALID_FILE_ATTRIBUTES) {
 				DumpBufferTxt(txt_filename, &map, orig_desc->ByteWidth, 'c', idx, stride, offset);
 			}
 		} else if (buf_type_mask & FrameAnalysisOptions::DUMP_VB) {
 			determine_vb_count(&count, staged_ib_for_vb, call_info, ib_off_for_vb, ib_fmt);
 			dedupe_buf_filename_vb_txt(bin_filename, txt_filename, MAX_PATH, idx, stride, offset, first, count, layout, topology, call_info);
-			FALogInfo("Dumping Buffer %S -> %S\n", filename.c_str(), txt_filename);
+			FALogInfo(L"Dumping Buffer %ls -> %ls\n", filename.c_str(), txt_filename);
 			if (GetFileAttributes(txt_filename) == INVALID_FILE_ATTRIBUTES) {
 				DumpVBTxt(txt_filename, &map, orig_desc->ByteWidth, idx, stride, offset, first, count, layout, topology, call_info);
 			}
 		} else if (buf_type_mask & FrameAnalysisOptions::DUMP_IB) {
 			dedupe_buf_filename_ib_txt(bin_filename, txt_filename, MAX_PATH, ib_fmt, offset, first, count, topology);
-			FALogInfo("Dumping Buffer %S -> %S\n", filename.c_str(), txt_filename);
+			FALogInfo(L"Dumping Buffer %ls -> %ls\n", filename.c_str(), txt_filename);
 			if (GetFileAttributes(txt_filename) == INVALID_FILE_ATTRIBUTES) {
 				DumpIBTxt(txt_filename, &map, orig_desc->ByteWidth, ib_fmt, offset, first, count, topology);
 			}
@@ -1778,7 +1789,7 @@ void FrameAnalysisContext::DumpBufferImmediateCtx(ID3D11Buffer *staging, D3D11_B
 			// use the generic dump routine:
 
 			dedupe_buf_filename_txt(bin_filename, txt_filename, MAX_PATH, '?', idx, stride, offset);
-			FALogInfo("Dumping Buffer %S -> %S\n", filename.c_str(), txt_filename);
+			FALogInfo(L"Dumping Buffer %ls -> %ls\n", filename.c_str(), txt_filename);
 			if (GetFileAttributes(txt_filename) == INVALID_FILE_ATTRIBUTES) {
 				DumpBufferTxt(txt_filename, &map, orig_desc->ByteWidth, '?', idx, stride, offset);
 			}
@@ -1791,7 +1802,7 @@ void FrameAnalysisContext::DumpBufferImmediateCtx(ID3D11Buffer *staging, D3D11_B
 	if (analyse_options & FrameAnalysisOptions::FMT_DESC) {
 		filename.replace(ext, wstring::npos, L".dsc");
 		wcscpy_s(bin_ext, MAX_PATH + bin_filename - bin_ext, L".dsc");
-		FALogInfo("Dumping Buffer %S -> %S\n", filename.c_str(), bin_filename);
+		FALogInfo(L"Dumping Buffer %ls -> %ls\n", filename.c_str(), bin_filename);
 
 		if (GetFileAttributes(bin_filename) == INVALID_FILE_ATTRIBUTES)
 			DumpDesc(orig_desc, bin_filename);
@@ -1804,7 +1815,7 @@ out_unmap:
 
 void FrameAnalysisContext::DumpBuffer(ID3D11Buffer *buffer, wchar_t *filename,
 		FrameAnalysisOptions buf_type_mask, int idx, DXGI_FORMAT ib_fmt,
-		UINT stride, UINT offset, UINT first, UINT count, ID3DBlob *layout,
+		UINT stride, UINT offset, UINT first, UINT count, HackerInputLayout *layout,
 		D3D11_PRIMITIVE_TOPOLOGY topology, DrawCallInfo *call_info,
 		ID3D11Buffer **staged_ib_ret, ID3D11Buffer *staged_ib_for_vb, UINT ib_off_for_vb)
 {
@@ -1831,7 +1842,7 @@ void FrameAnalysisContext::DumpBuffer(ID3D11Buffer *buffer, wchar_t *filename,
 	hr = GetHackerDevice()->GetPassThroughOrigDevice1()->CreateBuffer(&desc, NULL, &staging);
 	UnlockResourceCreationMode();
 	if (FAILED(hr)) {
-		FALogErr("DumpBuffer failed to create staging buffer: 0x%x\n", hr);
+		FALogErr(L"DumpBuffer failed to create staging buffer: 0x%x\n", hr);
 		return;
 	}
 
@@ -1869,25 +1880,23 @@ void FrameAnalysisContext::DumpResource(ID3D11Resource *resource, wchar_t *filen
 				DumpBuffer((ID3D11Buffer*)resource, filename, buf_type_mask, idx, format, stride, offset,
 						0, 0, NULL, D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED, NULL, NULL, NULL, 0);
 			else
-				FALogInfo("Skipped dumping Buffer (No buffer formats enabled): %S\n", filename);
+				FALogInfo(L"Skipped dumping Buffer (No buffer formats enabled): %ls\n", filename);
 			break;
 		case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
-			FALogInfo("Skipped dumping Texture1D: %S\n", filename);
+			FALogInfo(L"Skipped dumping Texture1D: %ls\n", filename);
 			break;
 		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
 			if (analyse_options & FrameAnalysisOptions::FMT_2D_MASK) {
-				if (analyse_options & FrameAnalysisOptions::STEREO)
-					DumpStereoResource((ID3D11Texture2D*)resource, filename, format);
 				if (analyse_options & FrameAnalysisOptions::MONO)
-					Dump2DResource((ID3D11Texture2D*)resource, filename, false, NULL, format);
+					Dump2DResource((ID3D11Texture2D*)resource, filename, NULL, format);
 			} else
-				FALogInfo("Skipped dumping Texture2D (No Texture2D formats enabled): %S\n", filename);
+				FALogInfo(L"Skipped dumping Texture2D (No Texture2D formats enabled): %ls\n", filename);
 			break;
 		case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
-			FALogInfo("Skipped dumping Texture3D: %S\n", filename);
+			FALogInfo(L"Skipped dumping Texture3D: %ls\n", filename);
 			break;
 		default:
-			FALogInfo("Skipped dumping resource of unknown type %i: %S\n", dim, filename);
+			FALogInfo(L"Skipped dumping resource of unknown type %i: %ls\n", dim, filename);
 			break;
 	}
 }
@@ -1925,7 +1934,7 @@ void FrameAnalysisContext::get_deduped_dir(wchar_t *path, size_t size)
 }
 
 HRESULT FrameAnalysisContext::FrameAnalysisFilename(wchar_t *filename, size_t size, bool compute,
-		wchar_t *reg, char shader_type, int idx, ID3D11Resource *handle)
+		wchar_t *reg, char shader_type, int idx, ID3D11Resource *handle, uint32_t override_hash)
 {
 	struct ResourceHashInfo *info;
 	uint32_t hash, orig_hash;
@@ -1966,8 +1975,19 @@ HRESULT FrameAnalysisContext::FrameAnalysisFilename(wchar_t *filename, size_t si
 
 	EnterCriticalSectionPretty(&G->mResourcesLock);
 	try {
-		hash = G->mResources.at(handle).hash;
-		orig_hash = G->mResources.at(handle).orig_hash;
+		// If override_hash is provided (e.g. region hash for VB/IB,
+		// use it as the display hash so the dumped filename
+		// matches exactly what the hunting overlay shows and what must be
+		// placed in the ini [TextureOverride] hash. Fall back to the
+		// resource's stored base hash when no override is given.
+		if (override_hash) {
+			hash = override_hash;
+			orig_hash = G->mResources.at(handle).orig_hash;
+		}
+		else {
+			hash = G->mResources.at(handle).hash;
+			orig_hash = G->mResources.at(handle).orig_hash;
+		}
 	} catch (std::out_of_range) {
 		hash = orig_hash = 0;
 	}
@@ -2015,7 +2035,7 @@ HRESULT FrameAnalysisContext::FrameAnalysisFilename(wchar_t *filename, size_t si
 
 	hr = StringCchPrintfW(pos, rem, L".XXX");
 	if (FAILED(hr)) {
-		FALogErr("Failed to create filename: 0x%x\n", hr);
+		FALogErr(L"Failed to create filename: 0x%x\n", hr);
 		// Could create a shorter filename without hashes if this
 		// becomes a problem in practice
 	}
@@ -2084,7 +2104,7 @@ HRESULT FrameAnalysisContext::FrameAnalysisFilenameResource(wchar_t *filename, s
 
 	hr = StringCchPrintfW(pos, rem, L".XXX");
 	if (FAILED(hr))
-		FALogErr("Failed to create filename: 0x%x\n", hr);
+		FALogErr(L"Failed to create filename: 0x%x\n", hr);
 
 	return hr;
 }
@@ -2120,7 +2140,7 @@ const wchar_t* FrameAnalysisContext::dedupe_tex2d_filename(ID3D11Texture2D *reso
 
 	hr = GetDumpingContext()->Map(resource, 0, D3D11_MAP_READ, 0, &map);
 	if (FAILED(hr)) {
-		FALogErr("Frame Analysis filename deduplication failed to map resource: 0x%x\n", hr);
+		FALogErr(L"Frame Analysis filename deduplication failed to map resource: 0x%x\n", hr);
 		goto err;
 	};
 
@@ -2212,7 +2232,7 @@ void FrameAnalysisContext::rotate_deduped_file(const wchar_t *dedupe_filename)
 			// xxxxxxx.1.xxx - max 1023 hard links
 			// xxxxxxx.2.xxx - max 1023 hard links
 			// etc.
-			FALogInfo("Max hard links exceeded, rotating deduped file: %S\n", rotated_filename);
+			FALogInfo(L"Max hard links exceeded, rotating deduped file: %ls\n", rotated_filename);
 			MoveFile(dedupe_filename, rotated_filename);
 			CopyFile(rotated_filename, dedupe_filename, TRUE);
 			return;
@@ -2253,13 +2273,12 @@ static bool create_shortcut(const wchar_t *filename, const wchar_t *dedupe_filen
 {
 	IShellLink *psl;
 	IPersistFile *ppf;
-	HRESULT hr, dont_care;
 	wchar_t lnk_path[MAX_PATH];
 
-	dont_care = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	EnsureCOM();
 
 	// https://msdn.microsoft.com/en-us/library/aa969393.aspx#Shellink_Creating_Shortcut
-	hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, (LPVOID*)&psl);
+	HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, (LPVOID*)&psl);
 	if (SUCCEEDED(hr)) {
 		psl->SetPath(dedupe_filename);
 		hr = psl->QueryInterface(IID_IPersistFile, (LPVOID*)&ppf);
@@ -2270,8 +2289,6 @@ static bool create_shortcut(const wchar_t *filename, const wchar_t *dedupe_filen
 		}
 		psl->Release();
 	}
-
-	CoUninitialize();
 
 	return SUCCEEDED(hr);
 }
@@ -2295,7 +2312,7 @@ void FrameAnalysisContext::link_deduplicated_files(const wchar_t *filename, cons
 		}
 
 		// May fail if developer mode is not enabled on Windows 10:
-		FALogErr("Symlinking %S -> %S failed (0x%u), trying hard link\n",
+		FALogErr(L"Symlinking %ls -> %ls failed (0x%u), trying hard link\n",
 				filename, relative_path, GetLastError());
 	}
 
@@ -2321,7 +2338,7 @@ void FrameAnalysisContext::link_deduplicated_files(const wchar_t *filename, cons
 	if (MoveFile(dedupe_filename, filename))
 		return;
 
-	FALogErr("All attempts to link deduplicated file failed, giving up: %S -> %S\n",
+	FALogErr(L"All attempts to link deduplicated file failed, giving up: %ls -> %ls\n",
 			filename, dedupe_filename);
 }
 
@@ -2360,8 +2377,8 @@ void FrameAnalysisContext::_DumpTextures(char shader_type, bool compute,
 		if (!views[i])
 			continue;
 
-		if (i == G->StereoParamsReg || i == G->IniParamsReg) {
-			FALogInfo("Skipped 3DMigoto resource in slot %cs-t%i\n", shader_type, i);
+		if (i == G->IniParamsReg) {
+			FALogInfo(L"Skipped 3DMigoto resource in slot %Cs-t%i\n", shader_type, i);
 			continue;
 		}
 
@@ -2450,21 +2467,19 @@ void FrameAnalysisContext::DumpMesh(DrawCallInfo *call_info)
 		staged_ib->Release();
 }
 
-static bool vb_slot_in_layout(int slot, ID3DBlob *layout)
+static bool vb_slot_in_layout(int slot, const HackerInputLayout* layout)
 {
-	D3D11_INPUT_ELEMENT_DESC *layout_desc = NULL;
-	size_t layout_elements;
-	UINT i;
-
 	if (!layout)
 		return true;
 
-	layout_desc = (D3D11_INPUT_ELEMENT_DESC*)layout->GetBufferPointer();
-	layout_elements = layout->GetBufferSize() / sizeof(D3D11_INPUT_ELEMENT_DESC);
+	const D3D11_INPUT_ELEMENT_DESC* elements = layout->GetElements();
+	UINT count = layout->GetElementCount();
 
-	for (i = 0; i < layout_elements; i++)
-		if (layout_desc[i].InputSlot == slot)
+	for (UINT i = 0; i < count; ++i)
+	{
+		if (elements[i].InputSlot == slot)
 			return true;
+	}
 
 	return false;
 }
@@ -2478,8 +2493,7 @@ void FrameAnalysisContext::DumpVBs(DrawCallInfo *call_info, ID3D11Buffer *staged
 	wchar_t filename[MAX_PATH];
 	HRESULT hr;
 	UINT i, first = 0, count = 0;
-	ID3D11InputLayout *layout = NULL;
-	ID3DBlob *layout_desc = NULL;
+	HackerInputLayout* layout = nullptr;
 
 	if (call_info) {
 		first = call_info->FirstVertex;
@@ -2488,33 +2502,34 @@ void FrameAnalysisContext::DumpVBs(DrawCallInfo *call_info, ID3D11Buffer *staged
 
 	// The format of each vertex buffer cannot be obtained from this call.
 	// Rather, it is available in the input layout assigned to the
-	// pipeline, and there is no API to get the layout description, so we
-	// store it in a blob attached to the layout when it was created that
-	// we retrieve here.
+	// pipeline, and there is no API to get the layout description, so
+	// HackerInputLayout caches the original descriptors when the layout is created.
+	IAGetInputLayout(reinterpret_cast<ID3D11InputLayout**>(&layout));
 
 	GetPassThroughOrigContext1()->IAGetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, buffers, strides, offsets);
-	GetPassThroughOrigContext1()->IAGetInputLayout(&layout);
 	GetPassThroughOrigContext1()->IAGetPrimitiveTopology(&topology);
-	if (layout) {
-		UINT size = sizeof(ID3DBlob*);
-		layout->GetPrivateData(InputLayoutDescGuid, &size, &layout_desc);
-		layout->Release();
-	}
 
 	for (i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++) {
 		if (!buffers[i])
 			continue;
 
 		// Skip this vertex buffer if it is not used in the IA layout:
-		if (!vb_slot_in_layout(i, layout_desc))
+		if (!vb_slot_in_layout(i, layout))
 			goto continue_release;
 
-		hr = FrameAnalysisFilename(filename, MAX_PATH, false, L"vb", NULL, i, buffers[i]);
+		uint32_t region_hash = 0;
+		if (G->track_region_hashes && strides[i]) {
+			UINT region_offset = GetVertexBufferRegionOffset(strides[i], call_info, offsets[i]);
+			UINT region_size = GetVertexBufferRegionSize(strides[i], call_info);
+			region_hash = GetRegionHash(this, buffers[i], region_offset, region_size);
+		}
+
+		hr = FrameAnalysisFilename(filename, MAX_PATH, false, L"vb", NULL, i, buffers[i], region_hash);
 		if (SUCCEEDED(hr)) {
 			DumpBuffer(buffers[i], filename,
 				FrameAnalysisOptions::DUMP_VB, i,
 				ib_fmt, strides[i], offsets[i],
-				first, count, layout_desc, topology,
+				first, count, layout, topology,
 				call_info, NULL, staged_ib, ib_off);
 		}
 
@@ -2522,11 +2537,8 @@ continue_release:
 		buffers[i]->Release();
 	}
 
-	// Although the documentation fails to mention it, GetPrivateData()
-	// does bump the refcount if SetPrivateDataInterface() was used, so we
-	// need to balance it here:
-	if (layout_desc)
-		layout_desc->Release();
+	if (layout)
+		layout->Release();
 }
 
 void FrameAnalysisContext::DumpIB(DrawCallInfo *call_info, ID3D11Buffer **staged_ib, DXGI_FORMAT *format, UINT *offset)
@@ -2547,7 +2559,14 @@ void FrameAnalysisContext::DumpIB(DrawCallInfo *call_info, ID3D11Buffer **staged
 		return;
 	GetPassThroughOrigContext1()->IAGetPrimitiveTopology(&topology);
 
-	hr = FrameAnalysisFilename(filename, MAX_PATH, false, L"ib", NULL, -1, buffer);
+	uint32_t region_hash = 0;
+	if (G->track_region_hashes) {
+		UINT region_offset = GetIndexBufferRegionOffset(*format, call_info, *offset);
+		UINT region_size = GetIndexBufferRegionSize(*format, call_info);
+		region_hash = GetRegionHash(this, buffer, region_offset, region_size);
+	}
+
+	hr = FrameAnalysisFilename(filename, MAX_PATH, false, L"ib", NULL, -1, buffer, region_hash);
 	if (SUCCEEDED(hr)) {
 		DumpBuffer(buffer, filename,
 				FrameAnalysisOptions::DUMP_IB, -1,
@@ -2775,39 +2794,18 @@ void FrameAnalysisContext::update_per_draw_analyse_options()
 
 	// Log whenever new persistent options take effect, but only once:
 	if (G->cur_analyse_options & FrameAnalysisOptions::PERSIST) {
-		FALogInfo("analyse_options (persistent): %08x\n", G->cur_analyse_options);
+		FALogInfo(L"analyse_options (persistent): %08x\n", G->cur_analyse_options);
 		G->cur_analyse_options &= (FrameAnalysisOptions)~FrameAnalysisOptions::PERSIST;
 	}
 
 	if (!oneshot_valid)
 		return;
 
-	FALogInfo("analyse_options (one-shot): %08x\n", oneshot_analyse_options);
+	FALogInfo(L"analyse_options (one-shot): %08x\n", oneshot_analyse_options);
 
 	analyse_options = oneshot_analyse_options;
 	oneshot_analyse_options = FrameAnalysisOptions::INVALID;
 	oneshot_valid = false;
-}
-
-void FrameAnalysisContext::update_stereo_dumping_mode()
-{
-	NvU8 stereo = false;
-
-	NvAPIOverride();
-	Profiling::NvAPI_Stereo_IsEnabled(&stereo);
-	if (stereo)
-		Profiling::NvAPI_Stereo_IsActivated(GetHackerDevice()->mStereoHandle, &stereo);
-
-	if (!stereo) {
-		// 3D Vision is disabled, force mono dumping mode:
-		analyse_options &= (FrameAnalysisOptions)~FrameAnalysisOptions::STEREO_MASK;
-		analyse_options |= FrameAnalysisOptions::MONO;
-		return;
-	}
-
-	// If neither stereo or mono specified, default to stereo:
-	if (!(analyse_options & FrameAnalysisOptions::STEREO_MASK))
-		analyse_options |= FrameAnalysisOptions::STEREO;
 }
 
 void FrameAnalysisContext::set_default_dump_formats(bool draw)
@@ -2834,8 +2832,6 @@ void FrameAnalysisContext::set_default_dump_formats(bool draw)
 
 void FrameAnalysisContext::FrameAnalysisAfterDraw(bool compute, DrawCallInfo *call_info)
 {
-	NvAPI_Status nvret;
-
 	update_per_draw_analyse_options();
 
 	// Update: We now have an option to allow analysis on deferred
@@ -2845,7 +2841,7 @@ void FrameAnalysisContext::FrameAnalysisAfterDraw(bool compute, DrawCallInfo *ca
 	// but textures that come from the CPU, constant buffers, vertex
 	// buffers, etc that aren't changed on the GPU can still be useful.
 	//
-	// Later we might want to think about ways we could analyse render
+	// Later we might want to think about ways  we could analyse render
 	// targets & UAVs in deferred contexts - a simple approach would be to
 	// dump out the back buffer after executing a command list in the
 	// immediate context, however this would only show the combined result
@@ -2865,23 +2861,16 @@ void FrameAnalysisContext::FrameAnalysisAfterDraw(bool compute, DrawCallInfo *ca
 		return;
 	}
 
-	update_stereo_dumping_mode();
-	set_default_dump_formats(true);
+	analyse_options &= (FrameAnalysisOptions)~FrameAnalysisOptions::STEREO_MASK;
+	analyse_options |= FrameAnalysisOptions::MONO;
 
-	if ((analyse_options & FrameAnalysisOptions::FMT_2D_MASK) &&
-	    (analyse_options & FrameAnalysisOptions::STEREO) &&
-	    (GetDumpingContext()->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)) {
-		// Enable reverse stereo blit for all resources we are about to dump:
-		nvret = Profiling::NvAPI_Stereo_ReverseStereoBlitControl(GetHackerDevice()->mStereoHandle, true);
-		if (nvret != NVAPI_OK) {
-			FALogErr("DumpStereoResource failed to enable reverse stereo blit\n");
-			// Continue anyway, we should still be able to dump in 2D...
-		}
-	}
+	set_default_dump_formats(true);
 
 	// Grab the critical section now as we may need it several times during
 	// dumping for mResources
 	EnterCriticalSectionPretty(&G->mCriticalSection);
+
+	setlocale(LC_CTYPE, "en_US.UTF-8");
 
 	if (analyse_options & FrameAnalysisOptions::DUMP_CB)
 		DumpCBs(compute);
@@ -2903,13 +2892,9 @@ void FrameAnalysisContext::FrameAnalysisAfterDraw(bool compute, DrawCallInfo *ca
 	if (analyse_options & FrameAnalysisOptions::DUMP_DEPTH && !compute)
 		DumpDepthStencilTargets();
 
-	LeaveCriticalSection(&G->mCriticalSection);
+	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
 
-	if ((analyse_options & FrameAnalysisOptions::FMT_2D_MASK) &&
-	    (analyse_options & FrameAnalysisOptions::STEREO) &&
-	    (GetDumpingContext()->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)) {
-		Profiling::NvAPI_Stereo_ReverseStereoBlitControl(GetHackerDevice()->mStereoHandle, false);
-	}
+	LeaveCriticalSection(&G->mCriticalSection);
 
 	draw_call++;
 }
@@ -2927,7 +2912,7 @@ void FrameAnalysisContext::_FrameAnalysisAfterUpdate(ID3D11Resource *resource,
 
 	if (!(analyse_options & FrameAnalysisOptions::DEFRD_CTX_MASK) &&
 	   (GetPassThroughOrigContext1()->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)) {
-		FALogInfo("WARNING: dump_on_%S used on deferred context, but no deferred_ctx options enabled\n", type);
+		FALogInfo(L"WARNING: dump_on_%ls used on deferred context, but no deferred_ctx options enabled\n", type);
 		non_draw_call_dump_counter++;
 		return;
 	}
@@ -2968,7 +2953,6 @@ void FrameAnalysisContext::FrameAnalysisDump(ID3D11Resource *resource, FrameAnal
 		const wchar_t *target, DXGI_FORMAT format, UINT stride, UINT offset)
 {
 	wchar_t filename[MAX_PATH];
-	NvAPI_Status nvret;
 	HRESULT hr;
 
 	analyse_options = options;
@@ -2984,20 +2968,14 @@ void FrameAnalysisContext::FrameAnalysisDump(ID3D11Resource *resource, FrameAnal
 		analyse_options |= FrameAnalysisOptions::DEFRD_CTX_DELAY;
 	}
 
-	update_stereo_dumping_mode();
+	analyse_options &= (FrameAnalysisOptions)~FrameAnalysisOptions::STEREO_MASK;
+	analyse_options |= FrameAnalysisOptions::MONO;
+
 	set_default_dump_formats(false);
 
-	if ((analyse_options & FrameAnalysisOptions::STEREO) &&
-	    (GetDumpingContext()->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)) {
-		// Enable reverse stereo blit for all resources we are about to dump:
-		nvret = Profiling::NvAPI_Stereo_ReverseStereoBlitControl(GetHackerDevice()->mStereoHandle, true);
-		if (nvret != NVAPI_OK) {
-			FALogErr("FrameAnalyisDump failed to enable reverse stereo blit\n");
-			// Continue anyway, we should still be able to dump in 2D...
-		}
-	}
-
 	EnterCriticalSectionPretty(&G->mCriticalSection);
+
+	setlocale(LC_CTYPE, "en_US.UTF-8");
 
 	hr = FrameAnalysisFilenameResource(filename, MAX_PATH, target, resource, false);
 	if (FAILED(hr)) {
@@ -3008,12 +2986,9 @@ void FrameAnalysisContext::FrameAnalysisDump(ID3D11Resource *resource, FrameAnal
 	if (SUCCEEDED(hr))
 		DumpResource(resource, filename, analyse_options, -1, format, stride, offset);
 
-	LeaveCriticalSection(&G->mCriticalSection);
+	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
 
-	if ((analyse_options & FrameAnalysisOptions::STEREO) &&
-	    (GetDumpingContext()->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)) {
-		Profiling::NvAPI_Stereo_ReverseStereoBlitControl(GetHackerDevice()->mStereoHandle, false);
-	}
+	LeaveCriticalSection(&G->mCriticalSection);
 
 	non_draw_call_dump_counter++;
 }
@@ -3628,27 +3603,10 @@ STDMETHODIMP_(void) FrameAnalysisContext::ExecuteCommandList(THIS_
 		__in  ID3D11CommandList *pCommandList,
 		BOOL RestoreContextState)
 {
-	NvAPI_Status nvret;
-
 	FrameAnalysisLog("ExecuteCommandList(pCommandList:0x%p, RestoreContextState:%s)\n",
 			pCommandList, RestoreContextState ? "true" : "false");
 
-	if (G->analyse_frame) {
-		// Reverse stereo blit only applies to the immediate context - to work
-		// on a deferred context it must be enabled on the immediate context
-		// when the command list is executed. We don't know what options may
-		// have been used during the dump, so enable it unconditionally.
-		nvret = Profiling::NvAPI_Stereo_ReverseStereoBlitControl(GetHackerDevice()->mStereoHandle, true);
-		if (nvret != NVAPI_OK) {
-			FALogErr("FrameAnalyisDump failed to enable reverse stereo blit\n");
-			// Continue anyway, we should still be able to dump in 2D...
-		}
-	}
-
 	HackerContext::ExecuteCommandList(pCommandList, RestoreContextState);
-
-	if (G->analyse_frame)
-		Profiling::NvAPI_Stereo_ReverseStereoBlitControl(GetHackerDevice()->mStereoHandle, false);
 
 	dump_deferred_resources(pCommandList);
 }
@@ -4859,7 +4817,7 @@ void STDMETHODCALLTYPE FrameAnalysisContext::VSSetConstantBuffers1(
 {
 	FrameAnalysisLog("VSSetConstantBuffers1(StartSlot:%u, NumBuffers:%u, ppConstantBuffers:0x%p, pFirstConstant:0x%p, pNumConstants:0x%p)\n",
 			StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
-	FrameAnalysisLogResourceArray(StartSlot, NumBuffers, (ID3D11Resource *const *)ppConstantBuffers);
+	FrameAnalysisLogConstantBufferArray(StartSlot, NumBuffers, (ID3D11Resource *const *)ppConstantBuffers, pFirstConstant, pNumConstants);
 
 	HackerContext::VSSetConstantBuffers1(StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
 }
@@ -4878,7 +4836,7 @@ void STDMETHODCALLTYPE FrameAnalysisContext::HSSetConstantBuffers1(
 {
 	FrameAnalysisLog("HSSetConstantBuffers1(StartSlot:%u, NumBuffers:%u, ppConstantBuffers:0x%p, pFirstConstant:0x%p, pNumConstants:0x%p)\n",
 			StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
-	FrameAnalysisLogResourceArray(StartSlot, NumBuffers, (ID3D11Resource *const *)ppConstantBuffers);
+	FrameAnalysisLogConstantBufferArray(StartSlot, NumBuffers, (ID3D11Resource* const*)ppConstantBuffers, pFirstConstant, pNumConstants);
 
 	HackerContext::HSSetConstantBuffers1(StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
 }
@@ -4897,7 +4855,7 @@ void STDMETHODCALLTYPE FrameAnalysisContext::DSSetConstantBuffers1(
 {
 	FrameAnalysisLog("DSSetConstantBuffers1(StartSlot:%u, NumBuffers:%u, ppConstantBuffers:0x%p, pFirstConstant:0x%p, pNumConstants:0x%p)\n",
 			StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
-	FrameAnalysisLogResourceArray(StartSlot, NumBuffers, (ID3D11Resource *const *)ppConstantBuffers);
+	FrameAnalysisLogConstantBufferArray(StartSlot, NumBuffers, (ID3D11Resource* const*)ppConstantBuffers, pFirstConstant, pNumConstants);
 
 	HackerContext::DSSetConstantBuffers1(StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
 }
@@ -4916,7 +4874,7 @@ void STDMETHODCALLTYPE FrameAnalysisContext::GSSetConstantBuffers1(
 {
 	FrameAnalysisLog("GSSetConstantBuffers1(StartSlot:%u, NumBuffers:%u, ppConstantBuffers:0x%p, pFirstConstant:0x%p, pNumConstants:0x%p)\n",
 			StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
-	FrameAnalysisLogResourceArray(StartSlot, NumBuffers, (ID3D11Resource *const *)ppConstantBuffers);
+	FrameAnalysisLogConstantBufferArray(StartSlot, NumBuffers, (ID3D11Resource* const*)ppConstantBuffers, pFirstConstant, pNumConstants);
 
 	HackerContext::GSSetConstantBuffers1(StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
 }
@@ -4935,7 +4893,7 @@ void STDMETHODCALLTYPE FrameAnalysisContext::PSSetConstantBuffers1(
 {
 	FrameAnalysisLog("PSSetConstantBuffers1(StartSlot:%u, NumBuffers:%u, ppConstantBuffers:0x%p, pFirstConstant:0x%p, pNumConstants:0x%p)\n",
 			StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
-	FrameAnalysisLogResourceArray(StartSlot, NumBuffers, (ID3D11Resource *const *)ppConstantBuffers);
+	FrameAnalysisLogConstantBufferArray(StartSlot, NumBuffers, (ID3D11Resource* const*)ppConstantBuffers, pFirstConstant, pNumConstants);
 
 	HackerContext::PSSetConstantBuffers1(StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
 }
@@ -4954,7 +4912,7 @@ void STDMETHODCALLTYPE FrameAnalysisContext::CSSetConstantBuffers1(
 {
 	FrameAnalysisLog("CSSetConstantBuffers1(StartSlot:%u, NumBuffers:%u, ppConstantBuffers:0x%p, pFirstConstant:0x%p, pNumConstants:0x%p)\n",
 			StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
-	FrameAnalysisLogResourceArray(StartSlot, NumBuffers, (ID3D11Resource *const *)ppConstantBuffers);
+	FrameAnalysisLogConstantBufferArray(StartSlot, NumBuffers, (ID3D11Resource* const*)ppConstantBuffers, pFirstConstant, pNumConstants);
 
 	HackerContext::CSSetConstantBuffers1(StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
 }

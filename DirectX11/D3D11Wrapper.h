@@ -4,9 +4,17 @@
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 
+class HackerDevice;
+
 
 void InitD311();
 void DestroyDLL();
+
+// Reuse the normal device/context setup when 3DMigoto is attached after the
+// application has already created its D3D11 device.
+HackerDevice* wrap_d3d11_device_and_context(
+	ID3D11Device **ppDevice,
+	ID3D11DeviceContext **ppImmediateContext);
 
 extern "C" HMODULE (__stdcall *fnOrigLoadLibraryExW)(
 	_In_       LPCWSTR lpLibFileName,
